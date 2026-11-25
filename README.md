@@ -1,6 +1,16 @@
-# WhackedRecomp
+<p align="center">
+  <img src="assets/logo.png" alt="Whacked! Recompiled" width="520" />
+</p>
 
-**Whacked!** (Original Xbox, 2002) static x86-to-x64 recompilation for **Windows** and **Linux**.
+<h3 align="center">Whacked! (Original Xbox, 2002) Static x86-to-x64 Recompilation for Windows &amp; Linux</h3>
+
+<p align="center">
+  <a href="https://github.com/sageajnz-create/WhackedRecomp/actions/workflows/ci.yml"><img src="https://github.com/sageajnz-create/WhackedRecomp/actions/workflows/ci.yml/badge.svg" alt="CI Build" /></a>
+  <a href="https://github.com/sageajnz-create/WhackedRecomp/releases/latest"><img src="https://img.shields.io/github/v/release/sageajnz-create/WhackedRecomp?color=1db954&label=Release" alt="Latest Release" /></a>
+  <img src="https://img.shields.io/badge/Platform-Windows%20x64%20%7C%20Linux%20x64-0d1117?logo=linux&logoColor=white" alt="Platform" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-f5a623" alt="MIT License" /></a>
+  <a href="https://recomplauncher.com"><img src="https://img.shields.io/badge/RecompLauncher-Easy%20Setup%20Ready-1db954" alt="RecompLauncher Ready" /></a>
+</p>
 
 > **Important:** This repository contains **zero copyrighted game assets, XBE binaries, keys, or disc images**. You must supply your own legally obtained copy of *Whacked!* (Original Xbox).
 

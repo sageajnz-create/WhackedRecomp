@@ -116,7 +116,7 @@ if(WIN32)
 endif()
 
 if(WIN32)
-    add_executable(WhackedRecomp WIN32 ${RUNTIME_SOURCES} ${RECOMP_SOURCES})
+    add_executable(WhackedRecomp WIN32 ${RUNTIME_SOURCES} ${RECOMP_SOURCES} src/whacked.rc)
 else()
     add_executable(WhackedRecomp ${RUNTIME_SOURCES} ${RECOMP_SOURCES})
 endif()

@@ -50,7 +50,7 @@ extern void hle_input_poll_ui_snapshot();
 
 namespace {
 
-constexpr const char* kAppVersion = "1.0.0";
+constexpr const char* kAppVersion = "1.0.1";
 
 SDL_Window* g_sdl_win = nullptr;
 std::atomic<bool> g_quit_requested{false};

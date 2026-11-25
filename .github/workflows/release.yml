@@ -55,7 +55,7 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           if [[ "$TAG" != v* ]]; then TAG="${{ inputs.tag }}"; fi
 
-          mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/scalable/apps
+          mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/512x512/apps AppDir/usr/share/icons/hicolor/scalable/apps
           cp build_linux/WhackedRecomp AppDir/usr/bin/WhackedRecomp
           cp recomplauncher.json README.md LICENSE AppDir/
 
@@ -68,6 +68,9 @@ jobs:
           Categories=Game;
           EOF
 
+          cp assets/icon.png AppDir/usr/share/icons/hicolor/512x512/apps/whackedrecomp.png
+          cp assets/icon.png AppDir/whackedrecomp.png
+          cp assets/icon.png AppDir/.DirIcon
           cat > AppDir/usr/share/icons/hicolor/scalable/apps/whackedrecomp.svg << 'EOF'
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
             <rect width="128" height="128" rx="22" fill="#0d1117"/>
@@ -75,7 +78,6 @@ jobs:
             <text x="64" y="82" text-anchor="middle" font-family="sans-serif" font-weight="bold" font-size="68" fill="#f5a623">W!</text>
           </svg>
           EOF
-          cp AppDir/usr/share/icons/hicolor/scalable/apps/whackedrecomp.svg AppDir/whackedrecomp.svg
 
           curl -sSL -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
           curl -sSL -o appimagetool.AppImage "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
