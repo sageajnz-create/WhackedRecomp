@@ -1,0 +1,39 @@
+# Build outputs & downloaded CMake dependencies
+build/
+build_*/
+out/
+cmake-build-*/
+.vs/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.a
+*.exe
+*.AppImage
+
+# Reverse-engineering scratch workspace & local extracted binaries
+build_work/
+_tmp*/
+screenshots/
+*.log
+
+# Runtime user saves, configs & caches (never ship in Git or releases)
+userdata/
+recompdata/
+
+# Retail Xbox disc images & copyrighted assets (Bring Your Own Game)
+*.iso
+*.xiso
+*.xbe
+*.bik
+*.pak
+*.wma
+*.wav
+*.xmv
+
+# OS junk
+.DS_Store
+Thumbs.db

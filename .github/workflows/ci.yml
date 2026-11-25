@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  validate-manifest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate recomplauncher.json against upstream schema
+        run: |
+          python3 -m pip install --quiet jsonschema
+          python3 -c "
+          import json, urllib.request, jsonschema
+          schema = json.loads(urllib.request.urlopen('https://raw.githubusercontent.com/elripalda/RecompLauncher/main/docs/recomplauncher.schema.json').read().decode())
+          data = json.load(open('recomplauncher.json', encoding='utf-8'))
+          jsonschema.validate(instance=data, schema=schema)
+          print('recomplauncher.json passed strict JSON Schema validation!')
+          "
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure Windows Release
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build Windows Release
+        run: cmake --build build --parallel
+      - name: Smoke test CLI flags
+        run: |
+          ./build/WhackedRecomp.exe --version | Out-String
+          ./build/WhackedRecomp.exe --help | Out-String
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl2-dev libgl-dev
+      - name: Configure Linux Release
+        run: cmake -B build_linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build Linux Release
+        run: cmake --build build_linux -j"$(nproc)"
+      - name: Smoke test CLI flags
+        run: |
+          ./build_linux/WhackedRecomp --version
+          ./build_linux/WhackedRecomp --help

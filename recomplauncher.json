@@ -1,0 +1,249 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "repo": "sageajnz-create/WhackedRecomp",
+  "name": "Whacked! Recompiled",
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your copy of Whacked! (Original Xbox): .iso / .xiso.iso disc image or extracted folder with default.xbe.",
+      "formats": [
+        { "type": "file", "extensions": ["iso", "xiso"] },
+        { "type": "folder" }
+      ],
+      "check": {
+        "file": "default.xbe",
+        "xdvdfs": "default.xbe"
+      }
+    }
+  ],
+  "start": {
+    "program": [
+      "WhackedRecomp.exe",
+      "WhackedRecomp-Linux-x64.AppImage",
+      "AppRun",
+      "WhackedRecomp"
+    ],
+    "args": [
+      "--data",
+      "{data}",
+      "--game",
+      "{input:game}",
+      "--no-launcher"
+    ]
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [
+        { "path": "{install}/userdata/whacked_config.ini", "if": "{install}/portable.txt" },
+        { "path": "{data}/whacked_config.ini" }
+      ],
+      "game_path": "General/iso_path",
+      "new": {
+        "Graphics/renderer": "auto",
+        "Graphics/width": "1280",
+        "Graphics/height": "720",
+        "Graphics/fullscreen": "0",
+        "Graphics/widescreen": "1",
+        "Graphics/hd720": "1",
+        "Graphics/unstretched_hud": "0",
+        "Graphics/msaa_4x": "1",
+        "Graphics/aniso_16x": "1",
+        "Graphics/bloom_sharpen": "1",
+        "Graphics/vsync": "1",
+        "Graphics/fps_cap": "60",
+        "Graphics/show_fps": "1",
+        "Audio/master_volume": "1",
+        "Audio/sfx_volume": "1",
+        "Audio/music_volume": "1",
+        "Audio/muted": "0",
+        "Input/deadzone_left": "0.15",
+        "Input/deadzone_right": "0.15",
+        "Input/rumble_enabled": "1",
+        "Input/rumble_strength": "1",
+        "Input/pad_preset": "0"
+      }
+    }
+  ],
+  "folders": {
+    "saves": [
+      { "path": "{data}/UDATA" },
+      { "path": "{data}/TDATA" }
+    ],
+    "logs": [
+      { "path": "{data}/logs" }
+    ]
+  },
+  "saves": [
+    "{data}/UDATA",
+    "{data}/TDATA",
+    "{data}/whacked_config.ini"
+  ],
+  "looks": {
+    "graphics_key": "Graphics/renderer",
+    "in": "main",
+    "lines": 480
+  },
+  "system": {
+    "windows": {
+      "version": "10",
+      "graphics": { "d3d11": "11_0", "opengl": "3.3" }
+    },
+    "linux": {
+      "glibc": "2.35",
+      "graphics": { "opengl": "3.3" }
+    }
+  },
+  "exit_codes": {
+    "2": "Could not open or verify your Whacked! ISO or game folder. Pick your disc image or folder again.",
+    "3": "The selected Xbox disc image or folder is not Whacked! (expected Title ID 0x4D530027)."
+  },
+  "settings": [
+    {
+      "id": "resolution",
+      "label": "Display Resolution",
+      "group": "Graphics",
+      "help": "Window and internal backbuffer resolution.",
+      "choices": [
+        { "label": "1280 x 720 (720p)",   "set": { "Graphics/width": "1280", "Graphics/height": "720" } },
+        { "label": "1600 x 900 (900p)",   "set": { "Graphics/width": "1600", "Graphics/height": "900" } },
+        { "label": "1920 x 1080 (1080p)", "set": { "Graphics/width": "1920", "Graphics/height": "1080" } },
+        { "label": "2560 x 1440 (1440p)", "set": { "Graphics/width": "2560", "Graphics/height": "1440" } },
+        { "label": "3840 x 2160 (4K)",    "set": { "Graphics/width": "3840", "Graphics/height": "2160" } }
+      ],
+      "defaults": { "Graphics/width": "1280", "Graphics/height": "720" }
+    },
+    {
+      "id": "window_mode",
+      "label": "Window Mode",
+      "group": "Graphics",
+      "help": "Start in a borderless desktop fullscreen window or resizable window.",
+      "choices": [
+        { "label": "Windowed",   "set": { "Graphics/fullscreen": "0" } },
+        { "label": "Fullscreen", "set": { "Graphics/fullscreen": "1" } }
+      ],
+      "defaults": { "Graphics/fullscreen": "0" }
+    },
+    {
+      "id": "renderer",
+      "label": "Graphics API",
+      "group": "Graphics",
+      "help": "Direct3D 11 (Windows default) or OpenGL 3.3 Core (Linux & Windows fallback).",
+      "choices": [
+        { "label": "Auto (D3D11 / OpenGL)", "set": { "Graphics/renderer": "auto" } },
+        { "label": "Direct3D 11 (Windows)", "set": { "Graphics/renderer": "d3d11" } },
+        { "label": "OpenGL 3.3 Core",       "set": { "Graphics/renderer": "opengl" } }
+      ],
+      "defaults": { "Graphics/renderer": "auto" }
+    },
+    {
+      "id": "widescreen",
+      "label": "16:9 Hor+ Widescreen",
+      "group": "Graphics",
+      "help": "Expands the horizontal field of view to match 16:9 displays.",
+      "choices": [
+        { "label": "On",  "set": { "Graphics/widescreen": "1" } },
+        { "label": "Off", "set": { "Graphics/widescreen": "0" } }
+      ],
+      "defaults": { "Graphics/widescreen": "1" }
+    },
+    {
+      "id": "msaa",
+      "label": "4x MSAA Anti-Aliasing",
+      "group": "Graphics",
+      "help": "Smooths jagged polygon edges using 4x multisampling.",
+      "choices": [
+        { "label": "On",  "set": { "Graphics/msaa_4x": "1" } },
+        { "label": "Off", "set": { "Graphics/msaa_4x": "0" } }
+      ],
+      "defaults": { "Graphics/msaa_4x": "1" }
+    },
+    {
+      "id": "aniso",
+      "label": "16x Anisotropic Filtering",
+      "group": "Graphics",
+      "help": "Keeps floor and arena textures sharp at oblique angles.",
+      "choices": [
+        { "label": "On",  "set": { "Graphics/aniso_16x": "1" } },
+        { "label": "Off", "set": { "Graphics/aniso_16x": "0" } }
+      ],
+      "defaults": { "Graphics/aniso_16x": "1" }
+    },
+    {
+      "id": "bloom",
+      "label": "Post-FX Bloom & Sharpen",
+      "group": "Graphics",
+      "help": "Applies subtle highlight bloom and crisp sharpening.",
+      "choices": [
+        { "label": "On",  "set": { "Graphics/bloom_sharpen": "1" } },
+        { "label": "Off", "set": { "Graphics/bloom_sharpen": "0" } }
+      ],
+      "defaults": { "Graphics/bloom_sharpen": "1" }
+    },
+    {
+      "id": "vsync",
+      "label": "Vertical Sync",
+      "group": "Graphics",
+      "help": "Prevents screen tearing cleanly synced to your monitor refresh.",
+      "choices": [
+        { "label": "On",  "set": { "Graphics/vsync": "1" } },
+        { "label": "Off", "set": { "Graphics/vsync": "0" } }
+      ],
+      "defaults": { "Graphics/vsync": "1" }
+    },
+    {
+      "id": "fps_cap",
+      "label": "Frame Rate Cap",
+      "group": "Graphics",
+      "advanced": true,
+      "help": "Frame rate limit when VSync is off (0 = uncapped; 60 recommended for Xbox timing).",
+      "slider": {
+        "key": "Graphics/fps_cap",
+        "min": 0,
+        "max": 144,
+        "step": 6,
+        "format": "%d"
+      },
+      "defaults": { "Graphics/fps_cap": "60" }
+    },
+    {
+      "id": "master_volume",
+      "label": "Master Volume",
+      "group": "Audio",
+      "help": "Overall audio volume for effects, music, and cutscenes.",
+      "slider": {
+        "key": "Audio/master_volume",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "format": "%.2f"
+      },
+      "defaults": { "Audio/master_volume": "1.0" }
+    },
+    {
+      "id": "pad_preset",
+      "label": "Controller Button Layout",
+      "group": "Controllers",
+      "help": "Matches physical labels on Xbox/PlayStation pads or swaps A/B and X/Y for Nintendo pads.",
+      "choices": [
+        { "label": "Xbox Standard",           "set": { "Input/pad_preset": "0" } },
+        { "label": "PlayStation DualSense",   "set": { "Input/pad_preset": "1" } },
+        { "label": "Nintendo Pro (Swap A/B)", "set": { "Input/pad_preset": "2" } }
+      ],
+      "defaults": { "Input/pad_preset": "0" }
+    },
+    {
+      "id": "rumble",
+      "label": "Controller Vibration (Rumble)",
+      "group": "Controllers",
+      "help": "Toggles dual-motor haptic feedback during combat.",
+      "choices": [
+        { "label": "On",  "set": { "Input/rumble_enabled": "1" } },
+        { "label": "Off", "set": { "Input/rumble_enabled": "0" } }
+      ],
+      "defaults": { "Input/rumble_enabled": "1" }
+    }
+  ]
+}
