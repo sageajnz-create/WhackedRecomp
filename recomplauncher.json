@@ -42,6 +42,7 @@
       ],
       "game_path": "General/iso_path",
       "new": {
+        "General/skip_launcher": "0",
         "Graphics/renderer": "auto",
         "Graphics/width": "1280",
         "Graphics/height": "720",
@@ -55,27 +56,53 @@
         "Graphics/vsync": "1",
         "Graphics/fps_cap": "60",
         "Graphics/show_fps": "1",
-        "Audio/master_volume": "1",
-        "Audio/sfx_volume": "1",
-        "Audio/music_volume": "1",
+        "Audio/master_volume": "1.0",
+        "Audio/sfx_volume": "1.0",
+        "Audio/music_volume": "1.0",
         "Audio/muted": "0",
         "Input/deadzone_left": "0.15",
         "Input/deadzone_right": "0.15",
         "Input/rumble_enabled": "1",
-        "Input/rumble_strength": "1",
+        "Input/rumble_strength": "1.0",
+        "Input/invert_cam_y": "0",
+        "Input/cam_sensitivity": "1.0",
         "Input/pad_preset": "0"
       }
     }
   ],
   "folders": {
     "saves": [
+      { "path": "{install}/userdata/UDATA", "if": "{install}/portable.txt" },
       { "path": "{data}/UDATA" },
       { "path": "{data}/TDATA" }
     ],
+    "data": [
+      { "path": "{install}/userdata", "if": "{install}/portable.txt" },
+      { "path": "{data}" }
+    ],
     "logs": [
+      { "path": "{install}/userdata/logs", "if": "{install}/portable.txt" },
       { "path": "{data}/logs" }
+    ],
+    "screenshots": [
+      { "path": "{install}/userdata/screenshots", "if": "{install}/portable.txt" },
+      { "path": "{data}/screenshots" }
     ]
   },
+  "actions": [
+    {
+      "id": "open_screenshots",
+      "label": "Open Screenshots",
+      "help": "Browse F12 PNG screenshots captured in-game.",
+      "open": "screenshots"
+    },
+    {
+      "id": "clear_shader_cache",
+      "label": "Clear Shader Cache",
+      "help": "Clears cached DXBC and OpenGL shader binaries so shaders recompile cleanly after GPU driver changes.",
+      "clear": "data/cache"
+    }
+  ],
   "saves": [
     "{data}/UDATA",
     "{data}/TDATA",
@@ -198,15 +225,27 @@
       "label": "Frame Rate Cap",
       "group": "Graphics",
       "advanced": true,
-      "help": "Frame rate limit when VSync is off (0 = uncapped; 60 recommended for Xbox timing).",
+      "help": "Frame rate limit (0 = uncapped; 60 recommended for native Xbox pacing, up to 240 supported).",
       "slider": {
         "key": "Graphics/fps_cap",
         "min": 0,
-        "max": 144,
+        "max": 240,
         "step": 6,
         "format": "%d"
       },
       "defaults": { "Graphics/fps_cap": "60" }
+    },
+    {
+      "id": "show_fps",
+      "label": "Performance HUD",
+      "group": "Graphics",
+      "advanced": true,
+      "help": "Shows the subtle FPS and backend pill in the top-left corner.",
+      "choices": [
+        { "label": "On",  "set": { "Graphics/show_fps": "1" } },
+        { "label": "Off", "set": { "Graphics/show_fps": "0" } }
+      ],
+      "defaults": { "Graphics/show_fps": "1" }
     },
     {
       "id": "master_volume",
@@ -223,16 +262,111 @@
       "defaults": { "Audio/master_volume": "1.0" }
     },
     {
+      "id": "sfx_volume",
+      "label": "Sound Effects Volume",
+      "group": "Audio",
+      "help": "In-game combat, announcer, and UI sound effects volume.",
+      "slider": {
+        "key": "Audio/sfx_volume",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "format": "%.2f"
+      },
+      "defaults": { "Audio/sfx_volume": "1.0" }
+    },
+    {
+      "id": "music_volume",
+      "label": "Music & Streams Volume",
+      "group": "Audio",
+      "help": "Background arena music and Bink cutscene stream volume.",
+      "slider": {
+        "key": "Audio/music_volume",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "format": "%.2f"
+      },
+      "defaults": { "Audio/music_volume": "1.0" }
+    },
+    {
+      "id": "muted",
+      "label": "Mute Audio",
+      "group": "Audio",
+      "advanced": true,
+      "help": "Mutes all game audio output.",
+      "choices": [
+        { "label": "Off", "set": { "Audio/muted": "0" } },
+        { "label": "On",  "set": { "Audio/muted": "1" } }
+      ],
+      "defaults": { "Audio/muted": "0" }
+    },
+    {
       "id": "pad_preset",
       "label": "Controller Button Layout",
       "group": "Controllers",
-      "help": "Matches physical labels on Xbox/PlayStation pads or swaps A/B and X/Y for Nintendo pads.",
+      "help": "Auto-detects connected hardware labels or overrides PlayStation / Nintendo face button layout.",
       "choices": [
-        { "label": "Xbox Standard",           "set": { "Input/pad_preset": "0" } },
-        { "label": "PlayStation DualSense",   "set": { "Input/pad_preset": "1" } },
-        { "label": "Nintendo Pro (Swap A/B)", "set": { "Input/pad_preset": "2" } }
+        { "label": "Auto (Xbox / Detected)",   "set": { "Input/pad_preset": "0" } },
+        { "label": "PlayStation DualSense",    "set": { "Input/pad_preset": "1" } },
+        { "label": "Nintendo Pro (Swap A/B)",  "set": { "Input/pad_preset": "2" } }
       ],
       "defaults": { "Input/pad_preset": "0" }
+    },
+    {
+      "id": "deadzone_left",
+      "label": "Left Stick Deadzone",
+      "group": "Controllers",
+      "advanced": true,
+      "help": "2D radial deadzone for movement stick.",
+      "slider": {
+        "key": "Input/deadzone_left",
+        "min": 0.0,
+        "max": 0.45,
+        "step": 0.01,
+        "format": "%.2f"
+      },
+      "defaults": { "Input/deadzone_left": "0.15" }
+    },
+    {
+      "id": "deadzone_right",
+      "label": "Right Stick Deadzone",
+      "group": "Controllers",
+      "advanced": true,
+      "help": "2D radial deadzone for camera stick.",
+      "slider": {
+        "key": "Input/deadzone_right",
+        "min": 0.0,
+        "max": 0.45,
+        "step": 0.01,
+        "format": "%.2f"
+      },
+      "defaults": { "Input/deadzone_right": "0.15" }
+    },
+    {
+      "id": "cam_sensitivity",
+      "label": "Camera Stick Sensitivity",
+      "group": "Controllers",
+      "help": "Scales right analog camera speed.",
+      "slider": {
+        "key": "Input/cam_sensitivity",
+        "min": 0.25,
+        "max": 2.5,
+        "step": 0.05,
+        "format": "%.2f"
+      },
+      "defaults": { "Input/cam_sensitivity": "1.00" }
+    },
+    {
+      "id": "invert_cam_y",
+      "label": "Invert Camera Y Axis",
+      "group": "Controllers",
+      "help": "Inverts vertical right stick camera movement.",
+      "choices": [
+        { "label": "Off", "set": { "Input/invert_cam_y": "0" } },
+        { "label": "On",  "set": { "Input/invert_cam_y": "1" } }
+      ],
+      "defaults": { "Input/invert_cam_y": "0" }
     },
     {
       "id": "rumble",
@@ -244,6 +378,22 @@
         { "label": "Off", "set": { "Input/rumble_enabled": "0" } }
       ],
       "defaults": { "Input/rumble_enabled": "1" }
+    },
+    {
+      "id": "rumble_strength",
+      "label": "Rumble Strength",
+      "group": "Controllers",
+      "advanced": true,
+      "when": { "Input/rumble_enabled": "1" },
+      "help": "Scales controller vibration intensity.",
+      "slider": {
+        "key": "Input/rumble_strength",
+        "min": 0.0,
+        "max": 1.5,
+        "step": 0.1,
+        "format": "%.2f"
+      },
+      "defaults": { "Input/rumble_strength": "1.00" }
     }
   ]
 }

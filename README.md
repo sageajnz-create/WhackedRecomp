@@ -9,7 +9,10 @@
   <a href="https://github.com/sageajnz-create/WhackedRecomp/releases/latest"><img src="https://img.shields.io/github/v/release/sageajnz-create/WhackedRecomp?color=1db954&label=Release" alt="Latest Release" /></a>
   <img src="https://img.shields.io/badge/Platform-Windows%20x64%20%7C%20Linux%20x64-0d1117?logo=linux&logoColor=white" alt="Platform" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-f5a623" alt="MIT License" /></a>
-  <a href="https://recomplauncher.com"><img src="https://img.shields.io/badge/RecompLauncher-Easy%20Setup%20Ready-1db954" alt="RecompLauncher Ready" /></a>
+</p>
+
+<p align="center">
+  <a href="https://recomplauncher.com/game/whackedrecomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 </p>
 
 > **Important:** This repository contains **zero copyrighted game assets, XBE binaries, keys, or disc images**. You must supply your own legally obtained copy of *Whacked!* (Original Xbox).
@@ -18,7 +21,7 @@
 
 ## How to Play
 
-1. Download the latest release for your OS (`WhackedRecomp-*-Windows-x64.zip`, `WhackedRecomp-*-Linux-x64.tar.gz`, or `WhackedRecomp-*-Linux-x64.AppImage`), **or install directly via [RecompLauncher](https://recomplauncher.com)**.
+1. Download the latest release for your OS (`WhackedRecomp-*-Windows-x64.zip`, `WhackedRecomp-*-Linux-x64.tar.gz`, or `WhackedRecomp-*-Linux-x64.AppImage`), **or install directly via [RecompLauncher](https://recomplauncher.com/game/whackedrecomp)**.
 2. Launch `WhackedRecomp` (`./WhackedRecomp` on Linux).
 3. On the **Play & Setup** tab, supply your copy of *Whacked!*:
    - **Drag and drop** your `.iso` / `.xiso.iso` disc image (trimmed XISO or full Redump XGD1 DVD) or extracted game folder (`default.xbe`) directly onto the launcher window, **or**
@@ -35,11 +38,12 @@
 
 ## Features
 
-- **Cross-Platform Graphics Backends**: Hardware **Direct3D 11** (Windows default) and **OpenGL 3.3 Core** (Linux default & optional `--renderer opengl` on Windows) with **4x MSAA**, **16x Anisotropic Filtering**, custom **NV2A shader translation** (HLSL 5.0 + GLSL 330 Core), and **DXBC disk shader caching**.
-- **Widescreen & HD Enhancements**: True **16:9 Hor+ widescreen**, optional **720p native Xbox mode flag**, optional **unstretched 4:3 HUD**, and a post-processing **Bloom & Sharpen** pass.
-- **AAA Launcher & In-Game Overlay**: Built-in **Dear ImGui** startup launcher and **`F1` / Xbox Guide / `L3+R3`** in-game pause/settings overlay with live changes and `F12` PNG screenshots.
-- **Expanded 4-Player Controller Support**: SDL2 GameController auto-detection with hot-plugging, Xbox / PlayStation / Nintendo button layout presets, radial deadzone tuning, dual-motor haptic rumble, and customizable keyboard bindings.
-- **Stereo Audio & Bink FMVs**: Real-time 44.1 kHz SDL2 stereo mixer with ADPCM/PCM decoding, separate Master/SFX/Music sliders, and Bink video/audio playback.
+- **Cross-Platform Graphics Backends**: Hardware **Direct3D 11** (Windows default) and **OpenGL 3.3 Core** (Linux default & optional `--renderer opengl` on Windows) with **4x MSAA**, **16x Anisotropic Filtering**, custom **NV2A shader translation** (HLSL 5.0 + GLSL 330 Core), and **DXBC / GLSL program binary disk caching**.
+- **Widescreen, Ultrawide & HD Enhancements**: True **16:9 / 21:9 Hor+ widescreen**, optional **720p native Xbox mode flag**, optional **unstretched 4:3 HUD**, and a post-processing **FidelityFX-style CAS Sharpen & 8-tap Bloom** pass.
+- **High-DPI Launcher & In-Game Overlay**: Built-in **Dear ImGui** startup launcher with bundled Xbox-themed artwork and **`F1` / Xbox Guide / `L3+R3`** in-game pause/settings overlay featuring full gamepad navigation, diagnostics/cache tools, and `F12` PNG screenshots.
+- **RecompAchievements Ready**: Integrated `rl-achievements` (`rcheevos`) runtime supporting RetroAchievements memory rules, save-load protection, and live Rich Presence when launched via [RecompLauncher](https://recomplauncher.com).
+- **Expanded 4-Player Controller Support**: SDL2 GameController auto-detection with hot-plugging, auto Xbox / PlayStation / Nintendo button glyphs, true 2D radial deadzones, camera sensitivity & Y-inversion controls, dual-motor haptic rumble, and customizable keyboard bindings.
+- **Stereo Audio & Bink FMVs**: Real-time 44.1 kHz SDL2 stereo mixer with ADPCM/PCM decoding, DirectSound mix-bin stereo panning, soft-clip limiter, separate Master/SFX/Music sliders, and Bink video/audio playback.
 - **Online & LAN Multiplayer (Virtual System Link)**: Zero-privilege virtual Xbox UDP router (`10.69.x.1` virtual IPs) supporting:
   - **LAN Multicast** auto-discovery between local/LAN instances
   - **Online Room Hosting & Joining** via shareable `WHK-XXXX-XXXX-XXXX` room codes or `IP:Port` (no root/admin required on Linux, includes optional UPnP & STUN external IP discovery)
@@ -78,11 +82,12 @@ All keyboard bindings can be remapped interactively inside the **Controllers** t
 ## Building from Source
 
 ### Windows (Visual Studio 2022/2026 + CMake + Ninja)
-CMake automatically fetches SDL2 (`release-2.30.9`), Dear ImGui (`v1.91.9b`), and `stb_image_write.h`.
+CMake automatically fetches SDL2 (`release-2.30.9`), Dear ImGui (`v1.91.9b`), `stb_image_write.h`, and `stb_image.h` (and compiles vendored `third_party/rl_achievements`).
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
 cmake --preset windows-release
 cmake --build --preset windows-release
+ctest --test-dir build --output-on-failure
 ```
 Output executable: `build\WhackedRecomp.exe`.
 
@@ -92,6 +97,7 @@ Install build prerequisites (`cmake`, `ninja-build`, `pkg-config`, `libsdl2-dev`
 sudo apt install build-essential cmake ninja-build pkg-config libsdl2-dev libgl-dev
 cmake --preset linux-release
 cmake --build --preset linux-release
+ctest --test-dir build_linux --output-on-failure
 ```
 Output executable: `build_linux/WhackedRecomp`.
 
@@ -108,4 +114,4 @@ WhackedRecomp [--game <iso-or-folder>] [--data <dir>] [--renderer auto|d3d11|ope
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT License — see [LICENSE](LICENSE). Third-party `rl-achievements`, `rcheevos`, and `cJSON` notices live under `third_party/rl_achievements/`.

@@ -32,6 +32,8 @@ jobs:
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build Windows Release
         run: cmake --build build --parallel
+      - name: Run CTest unit suite
+        run: ctest --test-dir build --output-on-failure
       - name: Smoke test CLI flags
         run: |
           ./build/WhackedRecomp.exe --version | Out-String
@@ -49,6 +51,8 @@ jobs:
         run: cmake -B build_linux -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build Linux Release
         run: cmake --build build_linux -j"$(nproc)"
+      - name: Run CTest unit suite
+        run: ctest --test-dir build_linux --output-on-failure
       - name: Smoke test CLI flags
         run: |
           ./build_linux/WhackedRecomp --version

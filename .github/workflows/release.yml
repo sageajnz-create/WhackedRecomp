@@ -24,6 +24,7 @@ jobs:
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
       - name: Package Windows ZIP
         shell: pwsh
         run: |
@@ -32,6 +33,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item build/WhackedRecomp.exe $stage/
           Copy-Item recomplauncher.json, README.md, LICENSE $stage/
+          Copy-Item -Recurse assets "$stage/assets"
+          New-Item -ItemType Directory -Force -Path "$stage/third_party/rl_achievements" | Out-Null
+          Copy-Item third_party/rl_achievements/LICENSE "$stage/third_party/rl_achievements/"
           Compress-Archive -Path "$stage/*" -DestinationPath "WhackedRecomp-$tag-Windows-x64.zip" -Force
       - uses: actions/upload-artifact@v4
         with:
@@ -50,14 +54,17 @@ jobs:
         run: |
           cmake -B build_linux -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build_linux -j"$(nproc)"
+          ctest --test-dir build_linux --output-on-failure
       - name: Package Portable Linux Folder as AppImage & Tarball
         run: |
           TAG="${GITHUB_REF_NAME}"
           if [[ "$TAG" != v* ]]; then TAG="${{ inputs.tag }}"; fi
 
-          mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/512x512/apps AppDir/usr/share/icons/hicolor/scalable/apps
+          mkdir -p AppDir/usr/bin AppDir/assets AppDir/third_party/rl_achievements AppDir/usr/share/icons/hicolor/512x512/apps AppDir/usr/share/icons/hicolor/scalable/apps
           cp build_linux/WhackedRecomp AppDir/usr/bin/WhackedRecomp
           cp recomplauncher.json README.md LICENSE AppDir/
+          cp -r assets/* AppDir/assets/
+          cp third_party/rl_achievements/LICENSE AppDir/third_party/rl_achievements/
 
           cat > AppDir/WhackedRecomp.desktop << 'EOF'
           [Desktop Entry]
