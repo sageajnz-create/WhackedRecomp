@@ -134,6 +134,8 @@ struct DrawStateSnapshot {
 
     float vp_x = 0, vp_y = 0, vp_w = 640, vp_h = 480, vp_minz = 0.0f, vp_maxz = 1.0f;
     float xb_fb_w = 640.0f, xb_fb_h = 480.0f;
+    bool xb_widescreen = false;
+    bool ss_prog_use_fb = false;
 
     // Textures & samplers [0..3]
     GpuTextureObj* tex[4]{};
@@ -163,6 +165,21 @@ void gfx_upload_texture(GpuTextureObj* t, uint32_t palette_va);
 void gfx_blit_rgba_rect(const void* bgra, int src_w, int src_h, int dst_x, int dst_y, int dst_w, int dst_h);
 void gfx_present();
 void gfx_request_screenshot(const std::string& filename);
+void gfx_retire_texture(GpuTextureObj* tex);
+void gfx_retire_buffer(uint32_t obj_va);
+
+struct GfxTransformParams {
+    float ss_w = 640.0f;
+    float ss_h = 480.0f;
+    float scale_x = 1.0f;
+};
+
+GfxTransformParams gfx_compute_transform_params(const DrawStateSnapshot& st, float rt_w, float rt_h,
+                                                bool widescreen_cfg, bool unstretched_hud_cfg);
+void gfx_pace_frame(int fps_cap);
 
 // Portable PNG writer (implemented via stb_image_write)
 bool gfx_save_png_rgba(const std::string& path, int w, int h, const uint8_t* rgba, int stride_bytes);
+void* gfx_load_ui_texture(const std::string& rel_path, int* out_w, int* out_h);
+void  gfx_destroy_ui_texture(void* tex_handle);
+int   gfx_get_last_draw_calls();

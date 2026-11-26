@@ -19,17 +19,36 @@ uint8_t* g_xbox_mem_base = nullptr;
 XbeImageInfo g_xbe_info;
 
 namespace {
-struct AllocBlock {
-    uint32_t va;
-    uint32_t size;
-    bool used;
-};
 
 std::mutex g_alloc_mtx;
 std::map<uint32_t, uint32_t> g_used_blocks; // va -> size
-std::vector<AllocBlock> g_free_blocks;
+std::map<uint32_t, uint32_t> g_free_by_va;  // sorted va -> size for O(log N) neighbor coalescing
+std::vector<uint32_t> g_free_tebs;
+std::map<uint32_t, uint32_t> g_teb_extra_tls; // kpcr_va -> bump-allocated TLS VA if > 0x400
 uint32_t g_next_bump = HleKernelDataLayout::ARENA_ALLOC_BASE;
 uint32_t g_next_teb_va = 0x00006000u; // 0x6000..0xFFFF reserved for secondary thread TEBs
+
+void insert_free_coalesced(uint32_t va, uint32_t size) {
+    if (size == 0) return;
+    auto next = g_free_by_va.lower_bound(va);
+    if (next != g_free_by_va.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == va) {
+            va = prev->first;
+            size += prev->second;
+            g_free_by_va.erase(prev);
+        }
+    }
+    if (next != g_free_by_va.end() && va + size == next->first) {
+        size += next->second;
+        g_free_by_va.erase(next);
+    }
+    if (va + size == g_next_bump) {
+        g_next_bump = va;
+    } else {
+        g_free_by_va[va] = size;
+    }
+}
 
 uint32_t rd_u32_le(const uint8_t* p, size_t off) {
     uint32_t v;
@@ -59,7 +78,9 @@ bool xbox_mem_init() {
     g_next_bump = HleKernelDataLayout::ARENA_ALLOC_BASE;
     g_next_teb_va = 0x00006000u;
     g_used_blocks.clear();
-    g_free_blocks.clear();
+    g_free_by_va.clear();
+    g_free_tebs.clear();
+    g_teb_extra_tls.clear();
     return true;
 }
 
@@ -245,17 +266,30 @@ void xbox_mem_protect_readonly() {
 }
 
 uint32_t xbox_alloc_teb(uint32_t stack_base_va, uint32_t stack_limit_va, uint32_t tls_size, uint32_t thread_id) {
-    std::lock_guard<std::mutex> lk(g_alloc_mtx);
-    uint32_t kpcr_va = g_next_teb_va;
-    if (kpcr_va + 0x1000u <= 0x00010000u) {
-        g_next_teb_va += 0x1000u;
-    } else {
-        // Fallback inside arena if many threads spawned
-        kpcr_va = g_next_bump;
-        g_next_bump += 0x1000u;
-    }
-    if (thread_id == 1) {
-        kpcr_va = HleKernelDataLayout::KPCR_PRIMARY_VA;
+    uint32_t eff_tls = (tls_size >= 0x14u) ? tls_size : 0x14u;
+    uint32_t kpcr_va = 0;
+    uint32_t extra_tls_va = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_alloc_mtx);
+        if (thread_id == 1) {
+            kpcr_va = HleKernelDataLayout::KPCR_PRIMARY_VA;
+        } else if (!g_free_tebs.empty()) {
+            kpcr_va = g_free_tebs.back();
+            g_free_tebs.pop_back();
+        } else if (g_next_teb_va + 0x1000u <= 0x00010000u) {
+            kpcr_va = g_next_teb_va;
+            g_next_teb_va += 0x1000u;
+        } else {
+            kpcr_va = (g_next_bump + 0xFFFu) & ~0xFFFu;
+            g_next_bump = kpcr_va + 0x1000u;
+        }
+        if (eff_tls > 0x400u) {
+            uint32_t aligned = (eff_tls + 0xFFFu) & ~0xFFFu;
+            extra_tls_va = (g_next_bump + 0xFFFu) & ~0xFFFu;
+            g_next_bump = extra_tls_va + aligned;
+            g_used_blocks[extra_tls_va] = aligned;
+            g_teb_extra_tls[kpcr_va] = extra_tls_va;
+        }
     }
     std::memset(mem_ptr(kpcr_va), 0, 0x1000u);
 
@@ -263,12 +297,7 @@ uint32_t xbox_alloc_teb(uint32_t stack_base_va, uint32_t stack_limit_va, uint32_
     uint32_t kthread_va = kpcr_va + 0x600u;
     uint32_t tls_arr_va = kpcr_va + 0xA00u;
     // Xbox CRT indexes negatively from fs:[4] (_tls_index = -5 -> fs:[4] - 0x14)
-    uint32_t eff_tls = (tls_size >= 0x14u) ? tls_size : 0x14u;
-    uint32_t tls_data_va = (eff_tls <= 0x400u) ? (kpcr_va + 0xB00u) : ((g_next_bump + 0xFFFu) & ~0xFFFu);
-    if (tls_data_va >= HleKernelDataLayout::ARENA_ALLOC_BASE) {
-        uint32_t aligned = (eff_tls + 0xFFFu) & ~0xFFFu;
-        g_next_bump = tls_data_va + aligned;
-    }
+    uint32_t tls_data_va = extra_tls_va ? extra_tls_va : (kpcr_va + 0xB00u);
     std::memset(mem_ptr(tls_data_va), 0, eff_tls);
     wr32(tls_data_va, tls_data_va + 4u);
     uint32_t tls_end_va = tls_data_va + eff_tls;
@@ -309,25 +338,50 @@ uint32_t xbox_alloc_teb(uint32_t stack_base_va, uint32_t stack_limit_va, uint32_
     return kpcr_va;
 }
 
+void xbox_free_teb(uint32_t kpcr_va) {
+    if (!kpcr_va || kpcr_va == HleKernelDataLayout::KPCR_PRIMARY_VA) return;
+    std::lock_guard<std::mutex> lk(g_alloc_mtx);
+    auto tit = g_teb_extra_tls.find(kpcr_va);
+    if (tit != g_teb_extra_tls.end()) {
+        auto uit = g_used_blocks.find(tit->second);
+        if (uit != g_used_blocks.end()) {
+            insert_free_coalesced(tit->second, uit->second);
+            g_used_blocks.erase(uit);
+        }
+        g_teb_extra_tls.erase(tit);
+    }
+    if (kpcr_va >= 0x00006000u && kpcr_va + 0x1000u <= 0x00010000u) {
+        g_free_tebs.push_back(kpcr_va);
+    } else if (kpcr_va >= HleKernelDataLayout::ARENA_ALLOC_BASE) {
+        insert_free_coalesced(kpcr_va, 0x1000u);
+    }
+}
+
 uint32_t xbox_guest_alloc(uint32_t size, uint32_t align, bool zero_init) {
     if (size == 0) size = 16;
     if (align < 16) align = 16;
+    // Ensure power-of-two alignment
+    if ((align & (align - 1u)) != 0) {
+        uint32_t p = 16;
+        while (p < align && p < 0x10000000u) p <<= 1;
+        align = p;
+    }
     uint32_t aligned_sz = (size + align - 1u) & ~(align - 1u);
 
     std::lock_guard<std::mutex> lk(g_alloc_mtx);
-    // Try best/first fit from free list with matching alignment
-    for (size_t i = 0; i < g_free_blocks.size(); ++i) {
-        auto& b = g_free_blocks[i];
-        if ((b.va & (align - 1u)) == 0 && b.size >= aligned_sz) {
-            uint32_t va = b.va;
-            uint32_t rem = b.size - aligned_sz;
-            if (rem >= 4096u) {
-                b.va += aligned_sz;
-                b.size = rem;
-            } else {
-                aligned_sz = b.size;
-                g_free_blocks.erase(g_free_blocks.begin() + static_cast<ptrdiff_t>(i));
-            }
+    // First-fit across coalesced free blocks with arbitrary alignment support
+    for (auto it = g_free_by_va.begin(); it != g_free_by_va.end(); ++it) {
+        uint32_t blk_va = it->first;
+        uint32_t blk_sz = it->second;
+        uint32_t va = (blk_va + align - 1u) & ~(align - 1u);
+        if (va < blk_va) continue; // overflow guard
+        uint32_t lead = va - blk_va;
+        if (lead <= blk_sz && blk_sz - lead >= aligned_sz) {
+            uint32_t tail_va = va + aligned_sz;
+            uint32_t tail_sz = blk_sz - lead - aligned_sz;
+            g_free_by_va.erase(it);
+            if (lead > 0) insert_free_coalesced(blk_va, lead);
+            if (tail_sz > 0) insert_free_coalesced(tail_va, tail_sz);
             g_used_blocks[va] = aligned_sz;
             if (zero_init) std::memset(mem_ptr(va), 0, aligned_sz);
             return va;
@@ -335,7 +389,7 @@ uint32_t xbox_guest_alloc(uint32_t size, uint32_t align, bool zero_init) {
     }
 
     uint32_t va = (g_next_bump + align - 1u) & ~(align - 1u);
-    if (va + aligned_sz > HleKernelDataLayout::ARENA_ALLOC_END) {
+    if (va < g_next_bump || aligned_sz > HleKernelDataLayout::ARENA_ALLOC_END - va) {
         std::fprintf(stderr, "[MEM] Out of guest memory allocating 0x%X bytes!\n", aligned_sz);
         return 0;
     }
@@ -350,8 +404,9 @@ bool xbox_guest_free(uint32_t va) {
     std::lock_guard<std::mutex> lk(g_alloc_mtx);
     auto it = g_used_blocks.find(va);
     if (it == g_used_blocks.end()) return false;
-    g_free_blocks.push_back({va, it->second, false});
+    uint32_t sz = it->second;
     g_used_blocks.erase(it);
+    insert_free_coalesced(va, sz);
     return true;
 }
 
@@ -359,6 +414,18 @@ uint32_t xbox_guest_alloc_size(uint32_t va) {
     std::lock_guard<std::mutex> lk(g_alloc_mtx);
     auto it = g_used_blocks.find(va);
     return it != g_used_blocks.end() ? it->second : 0;
+}
+
+uint64_t xbox_mem_used_bytes() {
+    std::lock_guard<std::mutex> lk(g_alloc_mtx);
+    uint64_t used_bytes = 0;
+    for (const auto& kv : g_used_blocks) used_bytes += kv.second;
+    return used_bytes;
+}
+
+size_t xbox_mem_free_block_count() {
+    std::lock_guard<std::mutex> lk(g_alloc_mtx);
+    return g_free_by_va.size();
 }
 
 void xbox_guest_query_stats(uint32_t* total_pages, uint32_t* avail_pages) {

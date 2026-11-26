@@ -92,6 +92,8 @@ bool app_config_load(const std::string& userdata_root) {
         else if (k == "deadzone_right") g_cfg.deadzone_right = std::clamp(std::strtof(v.c_str(), nullptr), 0.0f, 0.5f);
         else if (k == "rumble_enabled") g_cfg.rumble_enabled = parse_bool(v);
         else if (k == "rumble_strength") g_cfg.rumble_strength = std::clamp(std::strtof(v.c_str(), nullptr), 0.0f, 1.5f);
+        else if (k == "invert_cam_y") g_cfg.invert_cam_y = parse_bool(v);
+        else if (k == "cam_sensitivity") g_cfg.cam_sensitivity = std::clamp(std::strtof(v.c_str(), nullptr), 0.25f, 2.5f);
         else if (k == "pad_preset") g_cfg.pad_preset = std::clamp(std::atoi(v.c_str()), 0, 2);
         else if (k == "key_up") g_cfg.keys.up = parse_scancode(v);
         else if (k == "key_down") g_cfg.keys.down = parse_scancode(v);
@@ -159,6 +161,8 @@ bool app_config_save(const std::string& userdata_root) {
         << "deadzone_right=" << g_cfg.deadzone_right << "\n"
         << "rumble_enabled=" << (g_cfg.rumble_enabled ? 1 : 0) << "\n"
         << "rumble_strength=" << g_cfg.rumble_strength << "\n"
+        << "invert_cam_y=" << (g_cfg.invert_cam_y ? 1 : 0) << "\n"
+        << "cam_sensitivity=" << g_cfg.cam_sensitivity << "\n"
         << "pad_preset=" << g_cfg.pad_preset << "\n"
         << "key_up=" << format_scancode(g_cfg.keys.up) << "\n"
         << "key_down=" << format_scancode(g_cfg.keys.down) << "\n"

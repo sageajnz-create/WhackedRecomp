@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -53,6 +54,39 @@ struct CachedGpuBuf {
 };
 std::unordered_map<uint32_t, CachedGpuBuf> g_static_vbs;
 std::unordered_map<uint32_t, CachedGpuBuf> g_static_ibs;
+std::mutex g_retire_mtx;
+std::vector<GpuTextureObj*> g_retired_textures;
+std::vector<uint32_t> g_retired_buffers;
+
+void drain_retired_dx_resources() {
+    std::vector<GpuTextureObj*> texs;
+    std::vector<uint32_t> bufs;
+    {
+        std::lock_guard<std::mutex> lk(g_retire_mtx);
+        texs.swap(g_retired_textures);
+        bufs.swap(g_retired_buffers);
+    }
+    for (uint32_t va : bufs) {
+        auto vit = g_static_vbs.find(va);
+        if (vit != g_static_vbs.end()) {
+            if (vit->second.buf) vit->second.buf->Release();
+            g_static_vbs.erase(vit);
+        }
+        auto iit = g_static_ibs.find(va);
+        if (iit != g_static_ibs.end()) {
+            if (iit->second.buf) iit->second.buf->Release();
+            g_static_ibs.erase(iit);
+        }
+    }
+    for (GpuTextureObj* t : texs) {
+        if (!t) continue;
+        if (t->dx_dsv) { static_cast<ID3D11DepthStencilView*>(t->dx_dsv)->Release(); t->dx_dsv = nullptr; }
+        if (t->dx_rtv) { static_cast<ID3D11RenderTargetView*>(t->dx_rtv)->Release(); t->dx_rtv = nullptr; }
+        if (t->dx_srv) { static_cast<ID3D11ShaderResourceView*>(t->dx_srv)->Release(); t->dx_srv = nullptr; }
+        if (t->dx_tex) { static_cast<ID3D11Texture2D*>(t->dx_tex)->Release(); t->dx_tex = nullptr; }
+        delete t;
+    }
+}
 
 ID3D11Buffer* g_cb_vs_nv2a = nullptr; // 192 * 16 bytes
 ID3D11Buffer* g_cb_vs_scr  = nullptr; // 32 bytes
@@ -88,7 +122,6 @@ int g_draw_skipped_shader = 0;
 int g_draw_skipped_vert = 0;
 double g_fps = 60.0;
 auto g_fps_t0 = std::chrono::steady_clock::now();
-auto g_frame_t0 = std::chrono::steady_clock::now();
 int g_fps_frames = 0;
 
 struct QuadVert { float x, y, u, v; uint32_t col; };
@@ -326,10 +359,38 @@ void init_quad_and_white() {
         Texture2D tx : register(t0); SamplerState sp : register(s0);
         struct VO { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };
         float4 main(VO i) : SV_TARGET {
-            float4 c = tx.Sample(sp, i.uv);
-            float3 bloom = max(c.rgb - 0.85, 0.0) * 0.25;
-            c.rgb = saturate(c.rgb + bloom);
-            return float4(c.rgb, 1.0);
+            uint tw = 1, th = 1;
+            tx.GetDimensions(tw, th);
+            float2 ts = 1.0 / float2(max(tw, 1u), max(th, 1u));
+
+            float3 cM = tx.Sample(sp, i.uv).rgb;
+            float3 cN = tx.Sample(sp, i.uv + float2(0.0, -ts.y)).rgb;
+            float3 cS = tx.Sample(sp, i.uv + float2(0.0,  ts.y)).rgb;
+            float3 cW = tx.Sample(sp, i.uv + float2(-ts.x, 0.0)).rgb;
+            float3 cE = tx.Sample(sp, i.uv + float2( ts.x, 0.0)).rgb;
+
+            // FidelityFX-style Contrast Adaptive Sharpening (no halo ringing on 2D UI)
+            float3 mn = min(cM, min(min(cN, cS), min(cW, cE)));
+            float3 mx = max(cM, max(max(cN, cS), max(cW, cE)));
+            float3 amp = saturate(min(mn, 1.0 - mx) / max(mx, 1e-5));
+            float3 w = -sqrt(amp) * 0.14;
+            float3 sharp = (cM + (cN + cS + cW + cE) * w) / max(1.0 + 4.0 * w, 0.05);
+            sharp = clamp(sharp, mn, mx);
+
+            // Dual-ring 8-tap soft-knee highlight bloom
+            float3 b0 = tx.Sample(sp, i.uv + ts * float2(-1.5, -1.5)).rgb
+                      + tx.Sample(sp, i.uv + ts * float2( 1.5, -1.5)).rgb
+                      + tx.Sample(sp, i.uv + ts * float2(-1.5,  1.5)).rgb
+                      + tx.Sample(sp, i.uv + ts * float2( 1.5,  1.5)).rgb;
+            float3 b1 = tx.Sample(sp, i.uv + ts * float2( 0.0, -3.25)).rgb
+                      + tx.Sample(sp, i.uv + ts * float2( 0.0,  3.25)).rgb
+                      + tx.Sample(sp, i.uv + ts * float2(-3.25, 0.0)).rgb
+                      + tx.Sample(sp, i.uv + ts * float2( 3.25, 0.0)).rgb;
+            float3 bAvg = b0 * 0.15 + b1 * 0.10;
+            float3 h = max(bAvg - 0.78, 0.0);
+            float3 glow = (h * h) / (h + 0.22);
+
+            return float4(saturate(sharp + glow * 0.36), 1.0);
         }
     )";
 
@@ -428,6 +489,25 @@ void ensure_dx_rt(GpuTextureObj* t) {
             ID3D11RenderTargetView* rtv = nullptr;
             g_dev->CreateRenderTargetView(tex, nullptr, &rtv);
             t->dx_rtv = rtv;
+            if (!t->is_cube && !t->dx_dsv) {
+                D3D11_TEXTURE2D_DESC dd{};
+                dd.Width = t->width;
+                dd.Height = t->height;
+                dd.MipLevels = 1;
+                dd.ArraySize = 1;
+                dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                dd.SampleDesc.Count = 1;
+                dd.Usage = D3D11_USAGE_DEFAULT;
+                dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+                ID3D11Texture2D* dtex = nullptr;
+                if (SUCCEEDED(g_dev->CreateTexture2D(&dd, nullptr, &dtex))) {
+                    ID3D11DepthStencilView* dsv = nullptr;
+                    if (SUCCEEDED(g_dev->CreateDepthStencilView(dtex, nullptr, &dsv))) {
+                        t->dx_dsv = dsv;
+                    }
+                    dtex->Release();
+                }
+            }
         }
         t->dirty = false;
     }
@@ -538,6 +618,7 @@ bool d3d11_init(void* sdl_win, const RendererSettings& settings) {
 }
 
 void d3d11_shutdown() {
+    drain_retired_dx_resources();
     ui_shutdown();
     nv2a_shaders_shutdown();
     for (auto& kv : g_blend_cache) if (kv.second) kv.second->Release();
@@ -617,12 +698,15 @@ void d3d11_clear(uint32_t flags, uint32_t color_argb, float z, uint32_t stencil,
     ID3D11RenderTargetView* rtv = (custom_rt && custom_rt->dx_rtv)
         ? static_cast<ID3D11RenderTargetView*>(custom_rt->dx_rtv)
         : g_msaa_rtv;
+    ID3D11DepthStencilView* dsv = custom_rt
+        ? static_cast<ID3D11DepthStencilView*>(custom_rt->dx_dsv)
+        : g_depth_dsv;
     if ((flags & 1u) && rtv) g_ctx->ClearRenderTargetView(rtv, c);
-    if ((flags & 6u) && g_depth_dsv && !custom_rt) {
+    if ((flags & 6u) && dsv) {
         UINT df = 0;
         if (flags & 2u) df |= D3D11_CLEAR_DEPTH;
         if (flags & 4u) df |= D3D11_CLEAR_STENCIL;
-        g_ctx->ClearDepthStencilView(g_depth_dsv, df, std::clamp(z, 0.0f, 1.0f), static_cast<UINT8>(stencil));
+        g_ctx->ClearDepthStencilView(dsv, df, std::clamp(z, 0.0f, 1.0f), static_cast<UINT8>(stencil));
     }
 }
 
@@ -713,7 +797,8 @@ void d3d11_draw(const DrawStateSnapshot& st) {
     if (st.custom_rt) ensure_dx_rt(st.custom_rt);
     ID3D11RenderTargetView* rtv = (st.custom_rt && st.custom_rt->dx_rtv)
         ? static_cast<ID3D11RenderTargetView*>(st.custom_rt->dx_rtv) : g_msaa_rtv;
-    ID3D11DepthStencilView* dsv = (st.custom_rt) ? nullptr : g_depth_dsv;
+    ID3D11DepthStencilView* dsv = (st.custom_rt)
+        ? static_cast<ID3D11DepthStencilView*>(st.custom_rt->dx_dsv) : g_depth_dsv;
     g_ctx->OMSetRenderTargets(1, &rtv, dsv);
 
     float rt_w = (st.custom_rt) ? static_cast<float>(st.custom_rt->width)  : static_cast<float>(g_cfg.width);
@@ -752,10 +837,7 @@ void d3d11_draw(const DrawStateSnapshot& st) {
     g_ctx->PSSetShaderResources(0, 4, srvs);
     g_ctx->PSSetSamplers(0, 4, samps);
 
-    bool guest_is_16x9 = (st.xb_fb_w / std::max(1.0f, st.xb_fb_h)) > 1.5f;
-    float target_asp = rt_w / std::max(1.0f, rt_h);
-    float ws = (g_cfg.widescreen && !guest_is_16x9) ? ((4.0f / 3.0f) / std::max(0.5f, target_asp)) : 1.0f;
-    float ui_ws = (!guest_is_16x9 && g_cfg.unstretched_hud) ? ws : 1.0f;
+    GfxTransformParams tp = gfx_compute_transform_params(st, rt_w, rt_h, g_cfg.widescreen, g_cfg.unstretched_hud);
 
     if (st.is_programmable_vs && st.vs_consts) {
         D3D11_MAPPED_SUBRESOURCE m{};
@@ -764,7 +846,7 @@ void d3d11_draw(const DrawStateSnapshot& st) {
             g_ctx->Unmap(g_cb_vs_nv2a, 0);
         }
         if (SUCCEEDED(g_ctx->Map(g_cb_vs_scr, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            float sc[8] = {st.xb_fb_w, st.xb_fb_h, st.vs->is_screenspace ? ui_ws : ws, st.vs->is_screenspace ? 1.0f : 0.0f, 1, 0, 0, 0};
+            float sc[8] = {tp.ss_w, tp.ss_h, tp.scale_x, st.vs->is_screenspace ? 1.0f : 0.0f, 1, 0, 0, 0};
             std::memcpy(m.pData, sc, 32);
             g_ctx->Unmap(g_cb_vs_scr, 0);
         }
@@ -792,9 +874,9 @@ void d3d11_draw(const DrawStateSnapshot& st) {
             d[149] = st.fog_start;
             d[150] = st.fog_end;
             d[151] = st.fog_density;
-            d[152] = st.xb_fb_w;
-            d[153] = st.xb_fb_h;
-            d[154] = st.vs->is_screenspace ? ui_ws : ws;
+            d[152] = tp.ss_w;
+            d[153] = tp.ss_h;
+            d[154] = tp.scale_x;
             d[155] = st.lighting_en ? 1.0f : 0.0f;
             d[156] = st.specular_en ? 1.0f : 0.0f;
             d[157] = 1.0f;
@@ -1011,6 +1093,7 @@ void d3d11_blit_rgba_rect(const void* bgra, int src_w, int src_h, int dst_x, int
 void d3d11_present() {
     if (!g_sc || !g_ctx) return;
     g_dx_owner_tid = std::this_thread::get_id();
+    drain_retired_dx_resources();
     apply_pending_dx_resize();
 
     ++g_frame_count;
@@ -1082,18 +1165,50 @@ void d3d11_present() {
     g_draw_skipped_shader = 0;
     g_draw_skipped_vert = 0;
 
-    if (g_cfg.fps_cap > 0 && !g_cfg.vsync) {
-        double target_ms = 1000.0 / g_cfg.fps_cap;
-        double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_frame_t0).count();
-        if (elapsed_ms + 1.5 < target_ms) {
-            Sleep(static_cast<DWORD>(target_ms - elapsed_ms));
-        }
-    }
-    g_frame_t0 = std::chrono::steady_clock::now();
+    gfx_pace_frame(g_cfg.fps_cap);
 }
 
 void d3d11_request_screenshot(const std::string& filename) {
     g_pending_screenshot = filename;
+}
+
+void d3d11_retire_texture(GpuTextureObj* tex) {
+    if (!tex) return;
+    std::lock_guard<std::mutex> lk(g_retire_mtx);
+    g_retired_textures.push_back(tex);
+}
+
+void d3d11_retire_buffer(uint32_t obj_va) {
+    if (!obj_va) return;
+    std::lock_guard<std::mutex> lk(g_retire_mtx);
+    g_retired_buffers.push_back(obj_va);
+}
+
+void* d3d11_create_ui_texture_rgba(const uint8_t* rgba, int w, int h) {
+    if (!g_dev || !rgba || w <= 0 || h <= 0) return nullptr;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = static_cast<UINT>(w);
+    td.Height = static_cast<UINT>(h);
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = rgba;
+    init.SysMemPitch = static_cast<UINT>(w * 4);
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&td, &init, &tex)) || !tex) return nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    HRESULT hr = g_dev->CreateShaderResourceView(tex, nullptr, &srv);
+    tex->Release();
+    return SUCCEEDED(hr) ? static_cast<void*>(srv) : nullptr;
+}
+
+void d3d11_destroy_ui_texture(void* tex_handle) {
+    if (!tex_handle) return;
+    static_cast<ID3D11ShaderResourceView*>(tex_handle)->Release();
 }
 
 #endif // _WIN32

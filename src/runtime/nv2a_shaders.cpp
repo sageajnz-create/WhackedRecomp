@@ -209,6 +209,8 @@ std::string decl_vs_input_struct(const Nv2aVertexDecl& decl, bool glsl, bool* ou
             if (!has[i]) continue;
             if (types[i] == 0x16) {
                 ss << "    uint v" << i << "_raw : TEXCOORD" << i << ";\n";
+            } else if (types[i] == 0x41) {
+                ss << "    uint4 v" << i << " : TEXCOORD" << i << ";\n";
             } else {
                 ss << "    float4 v" << i << " : TEXCOORD" << i << ";\n";
             }
@@ -239,8 +241,8 @@ void emit_unpack_inputs(std::ostringstream& ss, const Nv2aVertexDecl& decl, cons
                << "        int z = int((p >> 22u) << 22u) >> 22;\n"
                << "        v" << i << " = " << f4 << "(float(x) / 1023.0, float(y) / 1023.0, float(z) / 511.0, 1.0);\n"
                << "    }\n";
-        } else if (glsl && etype == 0x41) {
-            ss << "    vec4 v" << i << " = vec4(" << in_pre << i << ");\n";
+        } else if (etype == 0x41) {
+            ss << "    " << f4 << " v" << i << " = " << f4 << "(" << in_pre << i << ");\n";
         } else {
             ss << "    " << f4 << " v" << i << " = " << in_pre << i << ";\n";
             if (etype == 0x32) ss << "    v" << i << ".w = 1.0;\n";

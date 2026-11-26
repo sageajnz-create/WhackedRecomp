@@ -69,6 +69,8 @@ struct AppConfig {
     float deadzone_right = 0.15f;
     bool rumble_enabled = true;
     float rumble_strength = 1.0f;
+    bool invert_cam_y = false;
+    float cam_sensitivity = 1.0f;
     int pad_preset = 0; // PadButtonPreset
     KeyBindings keys{};
 

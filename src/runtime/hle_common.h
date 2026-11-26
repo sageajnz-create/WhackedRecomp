@@ -39,6 +39,7 @@ void hle_register_all();
 
 void hle_kernel_update_ticks();
 void hle_kernel_shutdown();
+void hle_bink_shutdown();
 
 bool hle_file_read(uint32_t handle, void* dst, uint32_t len, uint32_t* out_got);
 bool hle_file_seek(uint32_t handle, int64_t offset, uint32_t origin, uint64_t* out_pos);
@@ -51,3 +52,12 @@ void hle_kernel_signal_handle(uint32_t handle);
 void hle_kernel_notify_frame();
 uint64_t hle_kernel_get_stall_seq();
 void hle_input_set_frame(uint64_t frame_num);
+int  hle_input_get_primary_pad_type(); // 0=Xbox, 1=PlayStation, 2=Nintendo
+bool hle_input_get_port_info(int port, bool* out_connected, char* out_name, size_t max_name);
+void hle_input_apply_deadzone_2d(int16_t rx_in, int16_t ry_in, float inner_dz, float sensitivity,
+                                 bool invert_y, int16_t* out_x, int16_t* out_y);
+float hle_audio_soft_limit(float x);
+size_t hle_audio_decode_xbox_adpcm(const uint8_t* src, size_t src_bytes, int channels,
+                                   std::vector<int16_t>& out_pcm);
+void hle_set_log_sink(void (*sink)(const char*));
+void hle_log_note(const char* fmt, ...);

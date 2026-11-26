@@ -61,6 +61,19 @@ if(NOT EXISTS "${STB_INCLUDE_DIR}/stb_image_write.h")
         message(FATAL_ERROR "Failed to download stb_image_write.h: ${STB_DL_STATUS}")
     endif()
 endif()
+if(NOT EXISTS "${STB_INCLUDE_DIR}/stb_image.h")
+    file(MAKE_DIRECTORY "${STB_INCLUDE_DIR}")
+    file(DOWNLOAD
+        "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h"
+        "${STB_INCLUDE_DIR}/stb_image.h"
+        SHOW_PROGRESS
+        STATUS STB_IMG_DL_STATUS
+    )
+    list(GET STB_IMG_DL_STATUS 0 STB_IMG_DL_OK)
+    if(NOT STB_IMG_DL_OK EQUAL 0)
+        message(FATAL_ERROR "Failed to download stb_image.h: ${STB_IMG_DL_STATUS}")
+    endif()
+endif()
 
 # Dear ImGui static library
 set(IMGUI_SOURCES
@@ -130,15 +143,20 @@ else()
     target_link_options(WhackedRecomp PRIVATE -rdynamic "-Wl,-rpath,$ORIGIN/lib:$ORIGIN/../lib")
 endif()
 
+set(RL_ACH_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/rl_achievements)
+
 target_include_directories(WhackedRecomp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rl_achievements/include"
     "${STB_INCLUDE_DIR}"
 )
 
 target_link_libraries(WhackedRecomp PRIVATE
     whacked_imgui
     ${WHACKED_SDL_TARGET}
+    rl_achievements
 )
 
 if(WIN32)
@@ -165,3 +183,31 @@ else()
         m
     )
 endif()
+
+enable_testing()
+add_executable(whacked_tests
+    tests/whacked_tests.cpp
+    src/runtime/xbox_mem.cpp
+    src/runtime/xiso_vfs.cpp
+    src/runtime/app_config.cpp
+    src/runtime/hle_input.cpp
+    src/runtime/hle_audio.cpp
+    src/runtime/hle_net.cpp
+)
+target_include_directories(whacked_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rl_achievements/include"
+)
+target_link_libraries(whacked_tests PRIVATE ${WHACKED_SDL_TARGET} rl_achievements)
+if(WIN32)
+    target_link_libraries(whacked_tests PRIVATE ws2_32 user32 winmm dbghelp)
+else()
+    target_link_libraries(whacked_tests PRIVATE Threads::Threads dl m)
+endif()
+if(MSVC)
+    target_compile_options(whacked_tests PRIVATE /O2)
+else()
+    target_compile_options(whacked_tests PRIVATE -O2 -fno-strict-aliasing -fwrapv)
+endif()
+add_test(NAME WhackedRuntimeTests COMMAND whacked_tests)

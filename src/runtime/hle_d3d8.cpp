@@ -1,6 +1,7 @@
 #include "hle_common.h"
 #include "gfx_backend.h"
 #include "nv2a_shaders.h"
+#include "rl_achievements.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -193,6 +194,10 @@ float g_mat_emissive[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 GpuLight g_lights[64]{};
 
 float g_vp_x = 0, g_vp_y = 0, g_vp_w = 640, g_vp_h = 480, g_vp_minz = 0.0f, g_vp_maxz = 1.0f;
+bool     g_ss_prog_fb_mode = false;
+bool     g_cur_frame_had_prog_ss = false;
+bool     g_cur_frame_saw_hd_ss = false;
+uint32_t g_cur_frame_3d_draws = 0;
 std::atomic<uint64_t> g_frame_counter{0};
 uint32_t g_vis_counter = 1;
 
@@ -456,6 +461,7 @@ void sync_and_draw(uint32_t prim_type, uint32_t vertex_count, uint32_t index_cou
     st.ib_ptr = indices;
     st.xb_fb_w = static_cast<float>(g_xb_fb_w);
     st.xb_fb_h = static_cast<float>(g_xb_fb_h);
+    st.xb_widescreen = g_xb_widescreen_mode;
     st.vp_x = g_vp_x; st.vp_y = g_vp_y; st.vp_w = g_vp_w; st.vp_h = g_vp_h;
     st.vp_minz = g_vp_minz; st.vp_maxz = g_vp_maxz;
 
@@ -657,6 +663,26 @@ void sync_and_draw(uint32_t prim_type, uint32_t vertex_count, uint32_t index_cou
         st.is_programmable_ps = false;
     }
 
+    if (st.vs && st.vs->is_screenspace && st.is_programmable_vs && !st.custom_rt) {
+        g_cur_frame_had_prog_ss = true;
+        if (st.vb_ptrs[0] && st.vb_strides[0] >= 8) {
+            uint32_t vc = st.vertex_count ? std::min(st.vertex_count, 32u) : 4u;
+            const uint8_t* vb = static_cast<const uint8_t*>(st.vb_ptrs[0]);
+            for (uint32_t i = 0; i < vc; ++i) {
+                const float* xy = reinterpret_cast<const float*>(vb + i * st.vb_strides[0]);
+                if (xy[0] > 642.0f || xy[1] > 482.0f) {
+                    g_cur_frame_saw_hd_ss = true;
+                    g_ss_prog_fb_mode = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!(st.vs && st.vs->is_screenspace) && !st.custom_rt) {
+        ++g_cur_frame_3d_draws;
+    }
+    st.ss_prog_use_fb = g_ss_prog_fb_mode;
+
     gfx_draw(st);
 }
 
@@ -775,6 +801,10 @@ void hle_D3D_SetRenderTarget(CpuContext& ctx) {
             g_vp_h = static_cast<float>(std::max(1u, sit->second.height));
             g_vp_minz = 0.0f;
             g_vp_maxz = 1.0f;
+            if (g_hle_trace) {
+                std::printf("[D3D8] SetRenderTarget prt=0x%08X pds=0x%08X (%ux%u)\n",
+                            prt, pds, sit->second.width, sit->second.height);
+            }
         }
     }
     g_cur_ds_va = pds;
@@ -864,6 +894,10 @@ void hle_D3D_SetViewport(CpuContext& ctx) {
         g_vp_h = static_cast<float>(rd32(pvp + 12));
         g_vp_minz = rdf32(pvp + 16);
         g_vp_maxz = rdf32(pvp + 20);
+        if (g_hle_trace) {
+            std::printf("[D3D8] SetViewport(%.0f, %.0f, %.0f, %.0f, z=[%.2f, %.2f]) fb=%ux%u\n",
+                        g_vp_x, g_vp_y, g_vp_w, g_vp_h, g_vp_minz, g_vp_maxz, g_xb_fb_w, g_xb_fb_h);
+        }
     }
     hle_ret(ctx, 4);
 }
@@ -1461,6 +1495,17 @@ void hle_D3D_CreateDevice(CpuContext& ctx) {
     ensure_guest_device_allocated();
     g_front_gpu.width = g_back_gpu.width = g_depth_gpu.width = g_xb_fb_w;
     g_front_gpu.height = g_back_gpu.height = g_depth_gpu.height = g_xb_fb_h;
+    g_front_gpu.pitch = g_back_gpu.pitch = calc_pitch_xb(g_xb_fb_w, 0x1Eu);
+    g_depth_gpu.pitch = calc_pitch_xb(g_xb_fb_w, 0x2Au);
+    for (uint32_t sva : {g_front_surf_va, g_back_surf_va, g_depth_surf_va}) {
+        auto sit = g_surfaces.find(sva);
+        if (sit != g_surfaces.end()) {
+            sit->second.width = g_xb_fb_w;
+            sit->second.height = g_xb_fb_h;
+            sit->second.pitch = (sva == g_depth_surf_va) ? g_depth_gpu.pitch : g_back_gpu.pitch;
+            write_surface_struct(sva, sit->second.data_va, sit->second.xb_format, g_xb_fb_w, g_xb_fb_h, sit->second.pitch, 1u);
+        }
+    }
     g_vp_x = 0.0f; g_vp_y = 0.0f;
     g_vp_w = static_cast<float>(g_xb_fb_w);
     g_vp_h = static_cast<float>(g_xb_fb_h);
@@ -1477,10 +1522,38 @@ void hle_D3D_GetSuperSampleScale(CpuContext& ctx) {
 
 void hle_D3D_Swap(CpuContext& ctx) {
     // 0x0023E090: Swap(Flags) -> ret 4
+    bool has_3d = false;
+    {
+        std::lock_guard<std::mutex> lk(g_d3d_mtx);
+        if (g_cur_frame_had_prog_ss && !g_cur_frame_saw_hd_ss) {
+            g_ss_prog_fb_mode = false;
+        }
+        g_cur_frame_had_prog_ss = false;
+        g_cur_frame_saw_hd_ss = false;
+        has_3d = (g_cur_frame_3d_draws > 0);
+        g_cur_frame_3d_draws = 0;
+    }
     hle_kernel_notify_frame();
     uint64_t f = g_frame_counter.fetch_add(1ull) + 1ull;
     app_on_frame_presented(f);
     gfx_present();
+    rl_ach_frame();
+    {
+        static int s_last_mode = -1;
+        static int s_pending_mode = -1;
+        static int s_pending_streak = 0;
+        int cur_mode = has_3d ? 1 : 0;
+        if (cur_mode != s_pending_mode) {
+            s_pending_mode = cur_mode;
+            s_pending_streak = 1;
+        } else {
+            ++s_pending_streak;
+        }
+        if (cur_mode != s_last_mode && s_pending_streak >= 45) {
+            s_last_mode = cur_mode;
+            rl_ach_presence(cur_mode == 1 ? "In 3D Arena / Studio Show" : "Menus / Cutscene");
+        }
+    }
     hle_kernel_update_ticks();
     hle_ret_u32(ctx, 0u, 4);
 }
@@ -1500,7 +1573,144 @@ void hle_D3D_StaticInit(CpuContext& ctx) {
     hle_ret(ctx, 0);
 }
 
-void hle_D3D_ResourceRelease(CpuContext& ctx) {
+void release_standalone_surface_unlocked(uint32_t surf_va) {
+    auto sit = g_surfaces.find(surf_va);
+    if (sit == g_surfaces.end()) return;
+    GuestSurface surf = sit->second;
+    g_surfaces.erase(sit);
+    if (g_cur_rt_va == surf_va) g_cur_rt_va = g_back_surf_va;
+    if (g_cur_ds_va == surf_va) g_cur_ds_va = g_depth_surf_va;
+    if (surf.owns_gpu && surf.gpu) gfx_retire_texture(surf.gpu);
+    if (surf.data_va) xbox_guest_free(surf.data_va);
+    xbox_guest_free(surf_va);
+}
+
+void hle_D3D_ReleaseVS(CpuContext& ctx) {
+    // 0x0023BC00: handle is obj_va | 1
+    uint32_t h = hle_arg(ctx, 0);
+    uint32_t rem = 0;
+    if (h) {
+        std::lock_guard<std::mutex> lk(g_d3d_mtx);
+        uint32_t obj_va = (h & 1u) ? (h - 1u) : h;
+        uint32_t ref = rd32(obj_va);
+        if (ref > 1u) {
+            rem = ref - 1u;
+            wr32(obj_va, rem);
+        } else {
+            wr32(obj_va, 0u);
+            auto vit = g_vshaders.find(h);
+            if (vit != g_vshaders.end()) {
+                uint32_t ova = vit->second.obj_va;
+                g_vshaders.erase(vit);
+                if (g_cur_vs_handle == h) g_cur_vs_handle = 0;
+                if (ova) xbox_guest_free(ova);
+            }
+        }
+    }
+    hle_ret_u32(ctx, rem, 4);
+}
+
+void hle_D3D_ReleasePS(CpuContext& ctx) {
+    // 0x0023E5C0
+    uint32_t h = hle_arg(ctx, 0);
+    uint32_t rem = 0;
+    if (h) {
+        std::lock_guard<std::mutex> lk(g_d3d_mtx);
+        uint32_t ref = rd32(h);
+        if (ref > 1u) {
+            rem = ref - 1u;
+            wr32(h, rem);
+        } else {
+            wr32(h, 0u);
+            auto pit = g_pshaders.find(h);
+            if (pit != g_pshaders.end()) {
+                g_pshaders.erase(pit);
+                if (g_cur_ps_handle == h) g_cur_ps_handle = 0;
+                xbox_guest_free(h);
+            }
+        }
+    }
+    hle_ret_u32(ctx, rem, 4);
+}
+
+void hle_D3D_ReleaseResource(CpuContext& ctx) {
+    // 0x0023C760: D3DResource::Release (VertexBuffer, IndexBuffer, Texture, Surface, Palette)
+    uint32_t va = hle_arg(ctx, 0);
+    uint32_t rem = 0;
+    if (!va) { hle_ret_u32(ctx, 0u, 4); return; }
+    std::lock_guard<std::mutex> lk(g_d3d_mtx);
+    if (va == g_front_surf_va || va == g_back_surf_va || va == g_depth_surf_va) {
+        hle_ret_u32(ctx, 1u, 4);
+        return;
+    }
+    uint32_t common = rd32(va);
+    uint32_t ref = common & 0xFFFFu;
+    if (ref > 1u) {
+        rem = ref - 1u;
+        wr32(va, (common & ~0xFFFFu) | rem);
+        hle_ret_u32(ctx, rem, 4);
+        return;
+    }
+    wr32(va, common & ~0xFFFFu);
+
+    auto vbit = g_vbs.find(va);
+    if (vbit != g_vbs.end()) {
+        uint32_t data_va = vbit->second.data_va;
+        g_vbs.erase(vbit);
+        for (int s = 0; s < 4; ++s) {
+            if (g_vb_stream_obj[s] == va) g_vb_stream_obj[s] = 0;
+        }
+        gfx_retire_buffer(va);
+        if (data_va) xbox_guest_free(data_va);
+        xbox_guest_free(va);
+        hle_ret_u32(ctx, 0u, 4);
+        return;
+    }
+    auto ibit = g_ibs.find(va);
+    if (ibit != g_ibs.end()) {
+        uint32_t data_va = ibit->second.data_va;
+        g_ibs.erase(ibit);
+        if (g_cur_ib_va == va) g_cur_ib_va = 0;
+        gfx_retire_buffer(va);
+        if (data_va) xbox_guest_free(data_va);
+        xbox_guest_free(va);
+        hle_ret_u32(ctx, 0u, 4);
+        return;
+    }
+    auto tit = g_textures.find(va);
+    if (tit != g_textures.end()) {
+        GuestTexture gt = std::move(tit->second);
+        g_textures.erase(tit);
+        for (int s = 0; s < 4; ++s) {
+            if (g_bound_tex_va[s] == va) g_bound_tex_va[s] = 0;
+        }
+        for (uint32_t sva : gt.level_surf_vas) {
+            if (g_cur_rt_va == sva) g_cur_rt_va = g_back_surf_va;
+            if (g_cur_ds_va == sva) g_cur_ds_va = g_depth_surf_va;
+            g_surfaces.erase(sva);
+            xbox_guest_free(sva);
+        }
+        uint32_t data_va = gt.gpu ? gt.gpu->data_va : 0;
+        if (gt.gpu) gfx_retire_texture(gt.gpu);
+        if (data_va) xbox_guest_free(data_va);
+        xbox_guest_free(va);
+        hle_ret_u32(ctx, 0u, 4);
+        return;
+    }
+    auto sit = g_surfaces.find(va);
+    if (sit != g_surfaces.end()) {
+        if (sit->second.parent_tex_va == 0) {
+            release_standalone_surface_unlocked(va);
+        }
+        hle_ret_u32(ctx, 0u, 4);
+        return;
+    }
+    auto pit = g_palettes.find(va);
+    if (pit != g_palettes.end()) {
+        g_palettes.erase(pit);
+        if (g_cur_palette_va == va) g_cur_palette_va = 0;
+        xbox_guest_free(va);
+    }
     hle_ret_u32(ctx, 0u, 4);
 }
 
@@ -1663,39 +1873,42 @@ void hle_XGCompressRect(CpuContext& ctx) {
 }
 
 void hle_XGSetTextureHeader(CpuContext& ctx) {
-    // 0x00258F41: (Width, Height, Levels, pTexture, DataOffset, Format) -> ret 24
+    // 0x00258F41: Disassembly confirmed XGSetSurfaceHeader(Width, Height, Format, pSurface, DataOffset, Pitch) -> ret 24
     std::lock_guard<std::mutex> lk(g_d3d_mtx);
-    uint32_t w      = std::max(1u, hle_arg(ctx, 0));
-    uint32_t h      = std::max(1u, hle_arg(ctx, 1));
-    uint32_t levels = std::max(1u, hle_arg(ctx, 2));
-    uint32_t tex_va = hle_arg(ctx, 3);
+    uint32_t w        = std::max(1u, hle_arg(ctx, 0));
+    uint32_t h        = std::max(1u, hle_arg(ctx, 1));
+    uint32_t fmt      = hle_arg(ctx, 2);
+    uint32_t surf_va  = hle_arg(ctx, 3);
     uint32_t data_off = hle_arg(ctx, 4);
-    uint32_t fmt    = hle_arg(ctx, 5);
+    uint32_t pitch    = hle_arg(ctx, 5);
+    if (!pitch) pitch = calc_pitch_xb(w, fmt);
 
-    if (tex_va) {
-        uint32_t pitch = calc_pitch_xb(w, fmt);
-        write_surface_struct(tex_va, data_off, fmt, w, h, pitch, 5u);
-        auto it = g_textures.find(tex_va);
-        if (it == g_textures.end()) {
+    if (surf_va) {
+        write_surface_struct(surf_va, data_off, fmt, w, h, pitch, 5u);
+        auto sit = g_surfaces.find(surf_va);
+        if (sit == g_surfaces.end()) {
             auto* gpu = new GpuTextureObj();
-            gpu->guest_va = tex_va;
-            gpu->width = w; gpu->height = h; gpu->levels = levels;
+            gpu->guest_va = surf_va;
+            gpu->width = w; gpu->height = h; gpu->levels = 1u;
             gpu->xb_format = fmt; gpu->pitch = pitch; gpu->data_va = data_off;
-            gpu->dirty = true;
-            GuestTexture gt{};
-            gt.tex_va = tex_va; gt.gpu = gpu; gt.levels = levels; gt.locked_ever = true;
-            uint32_t s_va = xbox_guest_alloc(0x20u, 16u, true);
-            write_surface_struct(s_va, data_off, fmt, w, h, pitch, 1u);
-            g_surfaces[s_va] = {s_va, tex_va, gpu, w, h, fmt, pitch, data_off, 0, false, true, 0};
-            gt.level_surf_vas.push_back(s_va);
-            g_textures[tex_va] = std::move(gt);
+            gpu->is_render_target = true;
+            gpu->dirty = (data_off != 0);
+            g_surfaces[surf_va] = {surf_va, 0, gpu, w, h, fmt, pitch, data_off, 0, true, (data_off != 0), 0};
         } else {
-            it->second.gpu->width = w;
-            it->second.gpu->height = h;
-            it->second.gpu->xb_format = fmt;
-            it->second.gpu->pitch = pitch;
-            it->second.gpu->data_va = data_off;
-            it->second.gpu->dirty = true;
+            sit->second.width = w;
+            sit->second.height = h;
+            sit->second.xb_format = fmt;
+            sit->second.pitch = pitch;
+            sit->second.data_va = data_off;
+            if (sit->second.gpu) {
+                sit->second.gpu->width = w;
+                sit->second.gpu->height = h;
+                sit->second.gpu->xb_format = fmt;
+                sit->second.gpu->pitch = pitch;
+                sit->second.gpu->data_va = data_off;
+                sit->second.gpu->is_render_target = true;
+                sit->second.gpu->dirty = (data_off != 0);
+            }
         }
     }
     hle_ret(ctx, 24);
@@ -1778,9 +1991,9 @@ void hle_register_d3d8() {
         {0x0023B410u, hle_D3D_SetVSConstant4},
         {0x0023B5A0u, hle_D3D_SetVSConstantN},
         {0x0023B7F0u, hle_D3D_SetStreamSource},
-        {0x0023BC00u, hle_D3D_ResourceRelease},
+        {0x0023BC00u, hle_D3D_ReleaseVS},
         {0x0023BD20u, hle_D3D_SetVertexShader},
-        {0x0023C760u, hle_D3D_ResourceRelease},
+        {0x0023C760u, hle_D3D_ReleaseResource},
         {0x0023CBE0u, hle_D3D_CreateImageSurface},
         {0x0023CD40u, hle_D3D_SurfaceLockRect},
         {0x00239C40u, hle_D3D_CreatePalette2},
@@ -1798,7 +2011,7 @@ void hle_register_d3d8() {
         {0x0023E400u, hle_D3D_CreateVertexBuffer2},
         {0x0023E450u, hle_D3D_VertexBufferLock},
         {0x0023E570u, hle_D3D_CreatePixelShader},
-        {0x0023E5C0u, hle_D3D_ResourceRelease},
+        {0x0023E5C0u, hle_D3D_ReleasePS},
         {0x0023EA20u, hle_D3D_SetPixelShader},
         {0x0023EC20u, hle_D3D_SetPixelShaderConstant},
         // XGRPH

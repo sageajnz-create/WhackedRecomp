@@ -1,8 +1,11 @@
 #include "launcher_ui.h"
 #include "app_config.h"
 #include "gfx_backend.h"
+#include "hle_common.h"
 #include "net_lobby.h"
+#include "xbox_mem.h"
 #include "xiso_vfs.h"
+#include "rl_achievements.h"
 
 #include <SDL.h>
 #include "imgui.h"
@@ -15,11 +18,15 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <d3d11.h>
 #include "imgui_impl_dx11.h"
+#else
+#include <cstdlib>
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -44,7 +51,9 @@ namespace {
 enum class BackendUiType { None, DX11, OpenGL3 };
 
 BackendUiType g_ui_backend = BackendUiType::None;
-bool g_imgui_inited = false;
+std::atomic<bool> g_imgui_inited{false};
+std::atomic<bool> g_ui_wants_kb{false};
+std::atomic<bool> g_ui_wants_mouse{false};
 SDL_Window* g_sdl_win = nullptr;
 
 std::string g_userdata_root = "userdata";
@@ -53,10 +62,61 @@ bool g_iso_ok = false;
 std::string g_iso_detail;
 std::string g_backend_name = "Auto";
 
-bool g_launcher_active = false;
-bool g_overlay_open = false;
+std::atomic<bool> g_launcher_active{false};
+std::atomic<bool> g_overlay_open{false};
 bool g_launch_requested = false;
 bool g_quit_requested = false;
+
+void* g_logo_tex = nullptr;
+int   g_logo_w = 0, g_logo_h = 0;
+void* g_backdrop_tex = nullptr;
+int   g_backdrop_w = 0, g_backdrop_h = 0;
+bool  g_art_tried = false;
+float g_ui_scale = 1.0f;
+float g_applied_scale = 0.0f;
+
+float dp(float px) { return px * g_ui_scale; }
+
+void ensure_ui_art_loaded() {
+    if (g_art_tried || g_ui_backend == BackendUiType::None) return;
+    g_art_tried = true;
+    g_logo_tex = gfx_load_ui_texture("assets/logo.png", &g_logo_w, &g_logo_h);
+    g_backdrop_tex = gfx_load_ui_texture("assets/backdrop.jpg", &g_backdrop_w, &g_backdrop_h);
+}
+
+void destroy_ui_art_textures() {
+    if (g_logo_tex) { gfx_destroy_ui_texture(g_logo_tex); g_logo_tex = nullptr; }
+    if (g_backdrop_tex) { gfx_destroy_ui_texture(g_backdrop_tex); g_backdrop_tex = nullptr; }
+    g_logo_w = g_logo_h = g_backdrop_w = g_backdrop_h = 0;
+    g_art_tried = false;
+}
+
+void open_folder_in_os(const fs::path& dir) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    std::string p = dir.string();
+#ifdef _WIN32
+    ShellExecuteA(nullptr, "open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+    std::string cmd = "xdg-open \"" + p + "\" >/dev/null 2>&1 &";
+    std::system(cmd.c_str());
+#endif
+}
+
+int clear_shader_cache_files(const std::string& userdata_root) {
+    int removed = 0;
+    std::error_code ec;
+    fs::path cdir = fs::path(userdata_root) / "cache";
+    if (!fs::exists(cdir, ec)) return 0;
+    for (const auto& entry : fs::directory_iterator(cdir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        std::string ext = entry.path().extension().string();
+        if (ext == ".dxbc" || ext == ".glbin") {
+            if (fs::remove(entry.path(), ec)) ++removed;
+        }
+    }
+    return removed;
+}
 
 char g_iso_buf[512]{};
 char g_name_buf[64]{};
@@ -266,47 +326,58 @@ void set_toast(const std::string& msg, double secs = 3.0) {
     g_ui_toast_until = now_sec() + secs;
 }
 
-void apply_xbox_style() {
-    ImGui::StyleColorsDark();
+void apply_xbox_style(float scale = 1.0f) {
+    static ImGuiStyle s_base_style;
+    static bool s_base_captured = false;
     ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowPadding     = ImVec2(18.0f, 16.0f);
-    s.FramePadding      = ImVec2(10.0f, 6.0f);
-    s.CellPadding       = ImVec2(8.0f, 5.0f);
-    s.ItemSpacing       = ImVec2(10.0f, 8.0f);
-    s.ItemInnerSpacing  = ImVec2(6.0f, 4.0f);
-    s.WindowRounding    = 10.0f;
-    s.ChildRounding     = 8.0f;
-    s.FrameRounding     = 6.0f;
-    s.PopupRounding     = 6.0f;
-    s.GrabRounding      = 6.0f;
-    s.TabRounding       = 6.0f;
-    s.WindowBorderSize  = 1.0f;
-    s.ChildBorderSize   = 1.0f;
-    s.FrameBorderSize   = 1.0f;
+    if (!s_base_captured) {
+        ImGui::StyleColorsDark(&s_base_style);
+        s_base_style.WindowPadding     = ImVec2(18.0f, 16.0f);
+        s_base_style.FramePadding      = ImVec2(10.0f, 6.0f);
+        s_base_style.CellPadding       = ImVec2(8.0f, 5.0f);
+        s_base_style.ItemSpacing       = ImVec2(10.0f, 8.0f);
+        s_base_style.ItemInnerSpacing  = ImVec2(6.0f, 4.0f);
+        s_base_style.WindowRounding    = 10.0f;
+        s_base_style.ChildRounding     = 8.0f;
+        s_base_style.FrameRounding     = 6.0f;
+        s_base_style.PopupRounding     = 6.0f;
+        s_base_style.GrabRounding      = 6.0f;
+        s_base_style.TabRounding       = 6.0f;
+        s_base_style.WindowBorderSize  = 1.0f;
+        s_base_style.ChildBorderSize   = 1.0f;
+        s_base_style.FrameBorderSize   = 1.0f;
 
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg]             = ImVec4(0.06f, 0.07f, 0.10f, 0.96f);
-    c[ImGuiCol_ChildBg]              = ImVec4(0.09f, 0.11f, 0.15f, 0.92f);
-    c[ImGuiCol_PopupBg]              = ImVec4(0.08f, 0.10f, 0.14f, 0.98f);
-    c[ImGuiCol_Border]               = ImVec4(0.18f, 0.24f, 0.30f, 0.80f);
-    c[ImGuiCol_FrameBg]              = ImVec4(0.12f, 0.15f, 0.20f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.16f, 0.22f, 0.28f, 1.00f);
-    c[ImGuiCol_FrameBgActive]        = ImVec4(0.12f, 0.42f, 0.20f, 1.00f);
-    c[ImGuiCol_TitleBg]              = ImVec4(0.05f, 0.06f, 0.09f, 1.00f);
-    c[ImGuiCol_TitleBgActive]        = ImVec4(0.07f, 0.26f, 0.11f, 1.00f);
-    c[ImGuiCol_CheckMark]            = ImVec4(0.18f, 0.85f, 0.38f, 1.00f);
-    c[ImGuiCol_SliderGrab]           = ImVec4(0.14f, 0.72f, 0.31f, 1.00f);
-    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.24f, 0.90f, 0.44f, 1.00f);
-    c[ImGuiCol_Button]               = ImVec4(0.13f, 0.36f, 0.20f, 0.90f);
-    c[ImGuiCol_ButtonHovered]        = ImVec4(0.17f, 0.56f, 0.28f, 1.00f);
-    c[ImGuiCol_ButtonActive]         = ImVec4(0.20f, 0.70f, 0.35f, 1.00f);
-    c[ImGuiCol_Header]               = ImVec4(0.13f, 0.44f, 0.22f, 0.70f);
-    c[ImGuiCol_HeaderHovered]        = ImVec4(0.17f, 0.58f, 0.29f, 0.85f);
-    c[ImGuiCol_HeaderActive]         = ImVec4(0.20f, 0.72f, 0.35f, 1.00f);
-    c[ImGuiCol_Tab]                  = ImVec4(0.10f, 0.13f, 0.18f, 1.00f);
-    c[ImGuiCol_TabHovered]           = ImVec4(0.15f, 0.46f, 0.24f, 1.00f);
-    c[ImGuiCol_TabSelected]          = ImVec4(0.12f, 0.56f, 0.26f, 1.00f);
-    c[ImGuiCol_Separator]            = ImVec4(0.18f, 0.25f, 0.32f, 0.70f);
+        ImVec4* c = s_base_style.Colors;
+        c[ImGuiCol_WindowBg]             = ImVec4(0.06f, 0.07f, 0.10f, 0.96f);
+        c[ImGuiCol_ChildBg]              = ImVec4(0.09f, 0.11f, 0.15f, 0.92f);
+        c[ImGuiCol_PopupBg]              = ImVec4(0.08f, 0.10f, 0.14f, 0.98f);
+        c[ImGuiCol_Border]               = ImVec4(0.18f, 0.24f, 0.30f, 0.80f);
+        c[ImGuiCol_FrameBg]              = ImVec4(0.12f, 0.15f, 0.20f, 1.00f);
+        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.16f, 0.22f, 0.28f, 1.00f);
+        c[ImGuiCol_FrameBgActive]        = ImVec4(0.12f, 0.42f, 0.20f, 1.00f);
+        c[ImGuiCol_TitleBg]              = ImVec4(0.05f, 0.06f, 0.09f, 1.00f);
+        c[ImGuiCol_TitleBgActive]        = ImVec4(0.07f, 0.26f, 0.11f, 1.00f);
+        c[ImGuiCol_CheckMark]            = ImVec4(0.18f, 0.85f, 0.38f, 1.00f);
+        c[ImGuiCol_SliderGrab]           = ImVec4(0.14f, 0.72f, 0.31f, 1.00f);
+        c[ImGuiCol_SliderGrabActive]     = ImVec4(0.24f, 0.90f, 0.44f, 1.00f);
+        c[ImGuiCol_Button]               = ImVec4(0.13f, 0.36f, 0.20f, 0.90f);
+        c[ImGuiCol_ButtonHovered]        = ImVec4(0.17f, 0.56f, 0.28f, 1.00f);
+        c[ImGuiCol_ButtonActive]         = ImVec4(0.20f, 0.70f, 0.35f, 1.00f);
+        c[ImGuiCol_Header]               = ImVec4(0.13f, 0.44f, 0.22f, 0.70f);
+        c[ImGuiCol_HeaderHovered]        = ImVec4(0.17f, 0.58f, 0.29f, 0.85f);
+        c[ImGuiCol_HeaderActive]         = ImVec4(0.20f, 0.72f, 0.35f, 1.00f);
+        c[ImGuiCol_Tab]                  = ImVec4(0.10f, 0.13f, 0.18f, 1.00f);
+        c[ImGuiCol_TabHovered]           = ImVec4(0.15f, 0.46f, 0.24f, 1.00f);
+        c[ImGuiCol_TabSelected]          = ImVec4(0.12f, 0.56f, 0.26f, 1.00f);
+        c[ImGuiCol_Separator]            = ImVec4(0.18f, 0.25f, 0.32f, 0.70f);
+        s_base_captured = true;
+    }
+    scale = std::clamp(scale, 1.0f, 2.25f);
+    s = s_base_style;
+    s.ScaleAllSizes(scale);
+    ImGui::GetIO().FontGlobalScale = scale;
+    g_ui_scale = scale;
+    g_applied_scale = scale;
 }
 
 void sync_buffers_from_config() {
@@ -409,10 +480,9 @@ void render_graphics_tab() {
     if (ImGui::Checkbox("Post-FX Bloom & Sharpen", &cfg.bloom_sharpen)) push_gfx_settings_to_renderer(false);
 
     if (ImGui::Checkbox("Vertical Sync (VSync)", &cfg.vsync)) push_gfx_settings_to_renderer(false);
-    ImGui::SameLine(280.0f);
-    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SetNextItemWidth(260.0f);
     const char* cap_label = (cfg.fps_cap <= 0) ? "Uncapped" : "%d FPS";
-    if (ImGui::SliderInt("Frame Rate Cap", &cfg.fps_cap, 0, 144, cap_label)) {
+    if (ImGui::SliderInt("Frame Rate Cap", &cfg.fps_cap, 0, 240, cap_label)) {
         push_gfx_settings_to_renderer(false);
     }
 }
@@ -499,18 +569,34 @@ void render_controllers_tab() {
         ImGui::SmallButton(txt);
         ImGui::PopStyleColor();
     };
-    ImGui::TextDisabled("Port 1 Live Inputs:");
-    led("A", 0x100u, ImVec4(0.1f, 0.7f, 0.2f, 1.0f)); ImGui::SameLine();
-    led("B", 0x200u, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); ImGui::SameLine();
-    led("X", 0x400u, ImVec4(0.2f, 0.45f, 0.9f, 1.0f)); ImGui::SameLine();
-    led("Y", 0x800u, ImVec4(0.85f, 0.7f, 0.15f, 1.0f)); ImGui::SameLine();
-    led("BLK", 0x1000u, ImVec4(0.45f, 0.45f, 0.5f, 1.0f)); ImGui::SameLine();
-    led("WHT", 0x2000u, ImVec4(0.75f, 0.75f, 0.8f, 1.0f));
+    int pad_type = hle_input_get_primary_pad_type();
+    const char* l_a = (pad_type == 1) ? "Cross (A)" : (pad_type == 2 ? "B (A)" : "A");
+    const char* l_b = (pad_type == 1) ? "Circle (B)" : (pad_type == 2 ? "A (B)" : "B");
+    const char* l_x = (pad_type == 1) ? "Square (X)" : (pad_type == 2 ? "Y (X)" : "X");
+    const char* l_y = (pad_type == 1) ? "Triangle (Y)" : (pad_type == 2 ? "X (Y)" : "Y");
+    const char* l_wht = (pad_type == 1) ? "L1 (WHT)" : (pad_type == 2 ? "L (WHT)" : "WHT");
+    const char* l_blk = (pad_type == 1) ? "R1 (BLK)" : (pad_type == 2 ? "R (BLK)" : "BLK");
+
+    char p0_name[128]{};
+    bool p0_conn = false;
+    hle_input_get_port_info(0, &p0_conn, p0_name, sizeof(p0_name));
+    if (p0_conn && p0_name[0]) {
+        const char* fam_tag = (pad_type == 1) ? "PlayStation" : (pad_type == 2 ? "Nintendo" : "Xbox");
+        ImGui::TextColored(ImVec4(0.32f, 0.92f, 0.50f, 1.0f), "Port 1: %s [%s Glyphs]", p0_name, fam_tag);
+    } else {
+        ImGui::TextDisabled("Port 1 Live Inputs (Keyboard + Gamepad):");
+    }
+    led(l_a,   0x100u, ImVec4(0.1f, 0.7f, 0.2f, 1.0f)); ImGui::SameLine();
+    led(l_b,   0x200u, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); ImGui::SameLine();
+    led(l_x,   0x400u, ImVec4(0.2f, 0.45f, 0.9f, 1.0f)); ImGui::SameLine();
+    led(l_y,   0x800u, ImVec4(0.85f, 0.7f, 0.15f, 1.0f));
+    led(l_blk, 0x1000u, ImVec4(0.45f, 0.45f, 0.5f, 1.0f)); ImGui::SameLine();
+    led(l_wht, 0x2000u, ImVec4(0.75f, 0.75f, 0.8f, 1.0f)); ImGui::SameLine();
 
     led("UP", 0x01u, ImVec4(0.2f, 0.8f, 0.4f, 1.0f)); ImGui::SameLine();
     led("DN", 0x02u, ImVec4(0.2f, 0.8f, 0.4f, 1.0f)); ImGui::SameLine();
     led("LF", 0x04u, ImVec4(0.2f, 0.8f, 0.4f, 1.0f)); ImGui::SameLine();
-    led("RT", 0x08u, ImVec4(0.2f, 0.8f, 0.4f, 1.0f)); ImGui::SameLine();
+    led("RT", 0x08u, ImVec4(0.2f, 0.8f, 0.4f, 1.0f));
     led("START", 0x10u, ImVec4(0.2f, 0.8f, 0.4f, 1.0f)); ImGui::SameLine();
     led("BACK", 0x20u, ImVec4(0.2f, 0.8f, 0.4f, 1.0f));
 
@@ -519,9 +605,12 @@ void render_controllers_tab() {
     ImGui::SliderFloat("Left Deadzone", &cfg.deadzone_left, 0.0f, 0.45f, "%.2f");
     ImGui::SetNextItemWidth(200.0f);
     ImGui::SliderFloat("Right Deadzone", &cfg.deadzone_right, 0.0f, 0.45f, "%.2f");
-    const char* presets[] = {"Xbox Standard", "PlayStation DualSense/DS4", "Nintendo Pro (Swap A/B, X/Y)"};
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SliderFloat("Right Stick Sens", &cfg.cam_sensitivity, 0.25f, 2.50f, "%.2fx");
+    ImGui::Checkbox("Invert Camera Y Axis", &cfg.invert_cam_y);
+    const char* presets[] = {"Auto (Hardware Detect)", "PlayStation (Cross/Circle)", "Nintendo (Swap A/B, X/Y)"};
     ImGui::SetNextItemWidth(220.0f);
-    ImGui::Combo("Face Button Preset", &cfg.pad_preset, presets, 3);
+    ImGui::Combo("Glyph / Button Preset", &cfg.pad_preset, presets, 3);
     ImGui::EndGroup();
 
     ImGui::SameLine(0, 20.0f);
@@ -698,6 +787,57 @@ void render_multiplayer_tab() {
     ImGui::TextDisabled("Tip: Inside Whacked!, open Multiplayer -> System Link to Host or Join matches over LAN or Online Tunnel.");
 }
 
+void render_system_tools_tab() {
+    ImGui::TextColored(ImVec4(0.24f, 0.90f, 0.45f, 1.0f), "Runtime Diagnostics & Quick Utilities");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    double mem_mb = static_cast<double>(xbox_mem_used_bytes()) / (1024.0 * 1024.0);
+    int draw_calls = gfx_get_last_draw_calls();
+
+    if (ImGui::BeginChild("DiagMetrics", ImVec2(0, dp(122.0f)), true)) {
+        ImGui::Columns(2, nullptr, false);
+        ImGui::Text("Active Backend:   %s", g_backend_name.c_str());
+        ImGui::Text("UI Scale Factor:  %.2fx", g_ui_scale);
+        ImGui::Text("Draw Calls/Frame: %d", draw_calls);
+        ImGui::NextColumn();
+        ImGui::Text("Guest Arena RAM:  %.1f MB / 208.0 MB", mem_mb);
+        ImGui::Text("UserData Root:    %s", g_userdata_root.c_str());
+        if (rl_ach_connected()) {
+            ImGui::TextColored(ImVec4(0.32f, 0.92f, 0.50f, 1.0f), "RecompAchievements: Connected");
+        } else {
+            ImGui::TextDisabled("RecompAchievements: Standalone Mode");
+        }
+        ImGui::Columns(1);
+    }
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.24f, 0.90f, 0.45f, 1.0f), "Folders & Shader Cache");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ImGui::Button("Open Saves / UDATA", ImVec2(dp(170.0f), dp(30.0f)))) {
+        open_folder_in_os(fs::path(g_userdata_root) / "UDATA");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Open Screenshots", ImVec2(dp(160.0f), dp(30.0f)))) {
+        open_folder_in_os(fs::path(g_userdata_root) / "screenshots");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Open Logs", ImVec2(dp(120.0f), dp(30.0f)))) {
+        open_folder_in_os(fs::path(g_userdata_root) / "logs");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Shader Cache", ImVec2(dp(165.0f), dp(30.0f)))) {
+        int removed = clear_shader_cache_files(g_userdata_root);
+        set_toast("Cleared " + std::to_string(removed) + " cached shader files.", 3.5);
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Hotkeys: [F1] / [Guide] / [L3+R3] Menu  |  [F11] Fullscreen  |  [F12] Screenshot");
+}
+
 void render_launcher_window() {
     auto& cfg = app_config();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -711,39 +851,72 @@ void render_launcher_window() {
         return;
     }
 
-    // Hero Header Banner
+    // Hero Header Banner (with shipped artwork backdrop + logo when present)
     {
         ImVec2 p0 = ImGui::GetCursorScreenPos();
         float w = ImGui::GetContentRegionAvail().x;
+        float banner_h = dp(92.0f);
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilledMultiColor(p0, ImVec2(p0.x + w, p0.y + 76.0f),
-            IM_COL32(14, 78, 32, 255), IM_COL32(12, 36, 26, 255),
-            IM_COL32(10, 16, 24, 255), IM_COL32(12, 28, 22, 255));
-        dl->AddRect(p0, ImVec2(p0.x + w, p0.y + 76.0f), IM_COL32(36, 175, 76, 180), 8.0f, 0, 1.5f);
+        if (g_backdrop_tex && g_backdrop_w > 0 && g_backdrop_h > 0) {
+            float target_aspect = w / std::max(1.0f, banner_h);
+            float src_aspect = static_cast<float>(g_backdrop_w) / static_cast<float>(g_backdrop_h);
+            float u0 = 0.0f, u1 = 1.0f, v0 = 0.0f, v1 = 1.0f;
+            if (src_aspect < target_aspect) {
+                float vh = src_aspect / target_aspect;
+                v0 = 0.5f - vh * 0.5f;
+                v1 = 0.5f + vh * 0.5f;
+            } else {
+                float uw = target_aspect / src_aspect;
+                u0 = 0.5f - uw * 0.5f;
+                u1 = 0.5f + uw * 0.5f;
+            }
+            dl->AddImage((ImTextureID)(uintptr_t)g_backdrop_tex, p0, ImVec2(p0.x + w, p0.y + banner_h),
+                         ImVec2(u0, v0), ImVec2(u1, v1), IM_COL32(255, 255, 255, 115));
+        }
+        dl->AddRectFilledMultiColor(p0, ImVec2(p0.x + w, p0.y + banner_h),
+            IM_COL32(12, 74, 30, 195), IM_COL32(10, 32, 22, 180),
+            IM_COL32(8, 12, 18, 232), IM_COL32(10, 24, 18, 220));
+        dl->AddRect(p0, ImVec2(p0.x + w, p0.y + banner_h), IM_COL32(42, 190, 84, 195), dp(8.0f), 0, 1.5f);
 
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + 18.0f, p0.y + 12.0f));
-        ImGui::SetWindowFontScale(1.65f);
-        ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.28f, 1.0f), "WHACKED!");
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::SameLine(0, 14.0f);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 8.0f);
-        ImGui::TextColored(ImVec4(0.75f, 0.94f, 0.80f, 1.0f), "Original Xbox Static Recompilation  |  PC & Linux Edition");
+        float text_x = p0.x + dp(18.0f);
+        if (g_logo_tex && g_logo_w > 0 && g_logo_h > 0) {
+            float lh = banner_h - dp(14.0f);
+            float lw = lh * (static_cast<float>(g_logo_w) / static_cast<float>(g_logo_h));
+            lw = std::min(lw, dp(220.0f));
+            ImVec2 lp0(p0.x + dp(16.0f), p0.y + (banner_h - lh) * 0.5f);
+            dl->AddImage((ImTextureID)(uintptr_t)g_logo_tex, lp0, ImVec2(lp0.x + lw, lp0.y + lh));
+            text_x = lp0.x + lw + dp(18.0f);
+            ImGui::SetCursorScreenPos(ImVec2(text_x, p0.y + dp(18.0f)));
+            ImGui::TextColored(ImVec4(0.84f, 0.96f, 0.88f, 1.0f), "Original Xbox Static Recompilation  |  PC & Linux Edition");
+        } else {
+            ImGui::SetCursorScreenPos(ImVec2(text_x, p0.y + dp(14.0f)));
+            ImGui::SetWindowFontScale(1.65f);
+            ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.28f, 1.0f), "WHACKED!");
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::SameLine(0, dp(14.0f));
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + dp(8.0f));
+            ImGui::TextColored(ImVec4(0.75f, 0.94f, 0.80f, 1.0f), "Original Xbox Static Recompilation  |  PC & Linux Edition");
+        }
 
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + 18.0f, p0.y + 48.0f));
-        ImGui::TextDisabled("Renderer: %s   |   ISO: %s",
-                            g_backend_name.c_str(),
-                            g_iso_ok ? "Ready (Mounted)" : "Missing / Select XISO");
-        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + 86.0f));
+        ImGui::SetCursorScreenPos(ImVec2(text_x, p0.y + dp(52.0f)));
+        ImGui::TextColored(ImVec4(0.72f, 0.82f, 0.78f, 1.0f), "Renderer: %s   |   ISO: %s",
+                           g_backend_name.c_str(),
+                           g_iso_ok ? "Ready (Mounted)" : "Missing / Select XISO");
+        if (rl_ach_connected()) {
+            ImGui::SameLine(0, dp(16.0f));
+            ImGui::TextColored(ImVec4(0.32f, 0.92f, 0.50f, 1.0f), "|  RecompAchievements: Active");
+        }
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + banner_h + dp(10.0f)));
     }
 
-    float footer_h = 56.0f;
-    float body_h = std::max(200.0f, ImGui::GetContentRegionAvail().y - footer_h);
+    float footer_h = dp(58.0f);
+    float body_h = std::max(dp(200.0f), ImGui::GetContentRegionAvail().y - footer_h);
 
     if (ImGui::BeginChild("LauncherBody", ImVec2(0, body_h), false)) {
         if (ImGui::BeginTabBar("LauncherTabs")) {
             if (ImGui::BeginTabItem("  Play & Setup  ")) {
                 ImGui::Spacing();
-                ImGui::BeginChild("IsoCard", ImVec2(0, g_iso_ok ? 158.0f : 225.0f), true);
+                ImGui::BeginChild("IsoCard", ImVec2(0, dp(g_iso_ok ? 174.0f : 238.0f)), true);
                 ImGui::TextColored(ImVec4(0.24f, 0.90f, 0.45f, 1.0f), "Game Source (Whacked! XISO / Redump ISO / Extracted Folder)");
                 ImGui::Separator();
                 ImGui::Spacing();
@@ -806,9 +979,10 @@ void render_launcher_window() {
                 fs::path save_dir = fs::path(g_userdata_root) / "UDATA";
                 std::error_code ec;
                 bool has_saves = fs::exists(save_dir, ec);
-                ImGui::TextDisabled("Data Folder: %s (%s)   |   Tip: Drag & drop any ISO/folder here",
+                ImGui::TextDisabled("Data Folder: %s (%s)",
                                     g_userdata_root.c_str(),
                                     has_saves ? "Existing Save Profiles Present" : "Clean Profile Ready");
+                ImGui::TextDisabled("Tip: Drag & drop any .iso / .xiso.iso disc image or extracted folder onto this window.");
                 ImGui::EndChild();
 
                 render_file_browser_modal();
@@ -850,6 +1024,11 @@ void render_launcher_window() {
                 render_multiplayer_tab();
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("  Tools & Diagnostics  ")) {
+                ImGui::Spacing();
+                render_system_tools_tab();
+                ImGui::EndTabItem();
+            }
             ImGui::EndTabBar();
         }
     }
@@ -861,30 +1040,37 @@ void render_launcher_window() {
     ImGui::SameLine();
     if (now_sec() < g_ui_toast_until && !g_ui_toast.empty()) {
         ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.28f, 1.0f), "  |  %s", g_ui_toast.c_str());
+    } else {
+        int pt = hle_input_get_primary_pad_type();
+        const char* nav_hint = (pt == 1)
+            ? "  |  [D-Pad] Move  [Cross] Select  [Circle] Back"
+            : (pt == 2 ? "  |  [D-Pad] Move  [B] Select  [A] Back"
+                       : "  |  [D-Pad] Move  [A] Select  [B] Back");
+        ImGui::TextDisabled("%s", nav_hint);
     }
 
-    float right_x = ImGui::GetWindowWidth() - 405.0f;
-    if (right_x > ImGui::GetCursorPosX() + 10.0f) {
+    float right_x = ImGui::GetWindowWidth() - dp(415.0f);
+    if (right_x > ImGui::GetCursorPosX() + dp(10.0f)) {
         ImGui::SameLine(right_x);
     } else {
         ImGui::SameLine();
     }
 
-    if (ImGui::Button("Save Settings", ImVec2(115.0f, 34.0f))) {
+    if (ImGui::Button("Save Settings", ImVec2(dp(120.0f), dp(34.0f)))) {
         cfg.iso_path = g_iso_buf;
         cfg.player_name = g_name_buf;
         app_config_save(g_userdata_root);
         set_toast("Configuration saved!");
     }
     ImGui::SameLine();
-    if (ImGui::Button("Quit", ImVec2(80.0f, 34.0f))) {
+    if (ImGui::Button("Quit", ImVec2(dp(82.0f), dp(34.0f)))) {
         g_quit_requested = true;
     }
     ImGui::SameLine();
     ImGui::BeginDisabled(!g_iso_ok);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.11f, 0.56f, 0.24f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.72f, 0.32f, 1.0f));
-    if (ImGui::Button("PLAY WHACKED!", ImVec2(170.0f, 34.0f))) {
+    if (ImGui::Button("PLAY WHACKED!", ImVec2(dp(175.0f), dp(34.0f)))) {
         cfg.iso_path = g_iso_buf;
         cfg.player_name = g_name_buf;
         app_config_save(g_userdata_root);
@@ -933,29 +1119,33 @@ void render_overlay_window() {
     ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y),
                                                   IM_COL32(5, 8, 14, 155));
 
-    ImVec2 win_sz(std::min(880.0f, vp->Size.x * 0.88f), std::min(580.0f, vp->Size.y * 0.88f));
+    ImVec2 win_sz(std::min(dp(880.0f), vp->Size.x * 0.88f), std::min(dp(580.0f), vp->Size.y * 0.88f));
     ImGui::SetNextWindowSize(win_sz, ImGuiCond_Always);
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + (vp->Size.x - win_sz.x) * 0.5f,
                                    vp->Pos.y + (vp->Size.y - win_sz.y) * 0.5f), ImGuiCond_Always);
 
     ImGuiWindowFlags owf = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::Begin("Whacked! In-Game Menu   [F1 / Xbox Guide / L3+R3 to Close]", &g_overlay_open, owf)) {
-        float body_h = std::max(180.0f, ImGui::GetContentRegionAvail().y - 46.0f);
+    bool overlay_open = g_overlay_open.load(std::memory_order_acquire);
+    bool win_shown = ImGui::Begin("Whacked! In-Game Menu   [F1 / Xbox Guide / L3+R3 to Close]", &overlay_open, owf);
+    g_overlay_open.store(overlay_open, std::memory_order_release);
+    if (win_shown) {
+        float body_h = std::max(dp(180.0f), ImGui::GetContentRegionAvail().y - dp(46.0f));
         if (ImGui::BeginChild("OverlayBody", ImVec2(0, body_h), false)) {
             if (ImGui::BeginTabBar("OverlayTabs")) {
                 if (ImGui::BeginTabItem("Graphics")) { render_graphics_tab(); ImGui::EndTabItem(); }
                 if (ImGui::BeginTabItem("Audio")) { render_audio_tab(); ImGui::EndTabItem(); }
                 if (ImGui::BeginTabItem("Controllers")) { render_controllers_tab(); ImGui::EndTabItem(); }
                 if (ImGui::BeginTabItem("Multiplayer")) { render_multiplayer_tab(); ImGui::EndTabItem(); }
+                if (ImGui::BeginTabItem("System & Cache")) { render_system_tools_tab(); ImGui::EndTabItem(); }
                 ImGui::EndTabBar();
             }
         }
         ImGui::EndChild();
 
         ImGui::Separator();
-        if (ImGui::Button("Resume [F1]", ImVec2(120.0f, 30.0f))) g_overlay_open = false;
+        if (ImGui::Button("Resume [F1]", ImVec2(dp(120.0f), dp(30.0f)))) g_overlay_open = false;
         ImGui::SameLine();
-        if (ImGui::Button("Screenshot [F12]", ImVec2(140.0f, 30.0f))) {
+        if (ImGui::Button("Screenshot [F12]", ImVec2(dp(140.0f), dp(30.0f)))) {
             fs::path sdir = fs::path(g_userdata_root) / "screenshots";
             std::error_code ec;
             fs::create_directories(sdir, ec);
@@ -965,12 +1155,12 @@ void render_overlay_window() {
             set_toast("Saved screenshot to " + path);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Save Settings", ImVec2(120.0f, 30.0f))) {
+        if (ImGui::Button("Save Settings", ImVec2(dp(120.0f), dp(30.0f)))) {
             app_config_save(g_userdata_root);
             set_toast("Settings saved!");
         }
         ImGui::SameLine();
-        if (ImGui::Button("Quit Game", ImVec2(100.0f, 30.0f))) {
+        if (ImGui::Button("Quit Game", ImVec2(dp(100.0f), dp(30.0f)))) {
             g_quit_requested = true;
         }
         if (now_sec() < g_ui_toast_until && !g_ui_toast.empty()) {
@@ -1040,7 +1230,10 @@ void ui_init_gl3(void* sdl_win, void* gl_ctx) {
 }
 
 void ui_shutdown() {
-    if (!g_imgui_inited) return;
+    if (!g_imgui_inited.exchange(false, std::memory_order_acq_rel)) return;
+    g_ui_wants_kb.store(false, std::memory_order_release);
+    g_ui_wants_mouse.store(false, std::memory_order_release);
+    destroy_ui_art_textures();
 #ifdef _WIN32
     if (g_ui_backend == BackendUiType::DX11) ImGui_ImplDX11_Shutdown();
 #endif
@@ -1048,7 +1241,6 @@ void ui_shutdown() {
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
     g_ui_backend = BackendUiType::None;
-    g_imgui_inited = false;
 }
 
 void ui_process_sdl_event(const void* ev_ptr) {
@@ -1083,11 +1275,11 @@ void ui_process_sdl_event(const void* ev_ptr) {
 }
 
 bool ui_wants_keyboard() {
-    return g_imgui_inited && ImGui::GetIO().WantCaptureKeyboard;
+    return g_imgui_inited.load(std::memory_order_acquire) && g_ui_wants_kb.load(std::memory_order_acquire);
 }
 
 bool ui_wants_mouse() {
-    return g_imgui_inited && ImGui::GetIO().WantCaptureMouse;
+    return g_imgui_inited.load(std::memory_order_acquire) && g_ui_wants_mouse.load(std::memory_order_acquire);
 }
 
 void ui_set_launcher_active(bool active) {
@@ -1110,16 +1302,30 @@ bool ui_consume_quit_requested() {
 
 void ui_set_overlay_open(bool open) { g_overlay_open = open; }
 void ui_toggle_overlay() {
-    if (!g_launcher_active) g_overlay_open = !g_overlay_open;
+    if (!g_launcher_active.load(std::memory_order_acquire)) {
+        g_overlay_open.store(!g_overlay_open.load(std::memory_order_acquire), std::memory_order_release);
+    }
 }
 bool ui_is_overlay_open() { return g_overlay_open; }
 
 void ui_render_frame(bool is_opengl) {
     if (!g_imgui_inited) return;
+    ensure_ui_art_loaded();
 
     std::string hp_msg;
     if (hle_input_consume_hotplug_notice(hp_msg)) {
         set_toast(hp_msg, 3.5);
+    }
+
+    if (g_sdl_win) {
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(g_sdl_win, &ww, &wh);
+        float want_scale = (ww > 0 && wh > 0)
+            ? std::clamp(std::min(static_cast<float>(ww) / 1280.0f, static_cast<float>(wh) / 720.0f), 1.0f, 2.25f)
+            : 1.0f;
+        if (std::fabs(want_scale - g_applied_scale) > 0.05f) {
+            apply_xbox_style(want_scale);
+        }
     }
 
     ImGuiIO& io = ImGui::GetIO();
@@ -1128,6 +1334,8 @@ void ui_render_frame(bool is_opengl) {
     } else {
         io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     }
+    g_ui_wants_kb.store((g_launcher_active || g_overlay_open) && io.WantCaptureKeyboard, std::memory_order_release);
+    g_ui_wants_mouse.store((g_launcher_active || g_overlay_open) && io.WantCaptureMouse, std::memory_order_release);
 
     if (is_opengl) {
         ImGui_ImplOpenGL3_NewFrame();

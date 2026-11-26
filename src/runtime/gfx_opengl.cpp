@@ -9,10 +9,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -48,6 +52,38 @@ struct CachedGLBuf {
     uint32_t seq = 0;
 };
 std::unordered_map<uint32_t, CachedGLBuf> g_static_vbs;
+std::mutex g_gl_retire_mtx;
+std::vector<GpuTextureObj*> g_gl_retired_textures;
+std::vector<uint32_t> g_gl_retired_buffers;
+
+void drain_retired_gl_resources() {
+    std::vector<GpuTextureObj*> texs;
+    std::vector<uint32_t> bufs;
+    {
+        std::lock_guard<std::mutex> lk(g_gl_retire_mtx);
+        texs.swap(g_gl_retired_textures);
+        bufs.swap(g_gl_retired_buffers);
+    }
+    if (!g_gl_ctx) {
+        for (GpuTextureObj* t : texs) delete t;
+        return;
+    }
+    auto& gl = whacked_gl();
+    for (uint32_t va : bufs) {
+        auto vit = g_static_vbs.find(va);
+        if (vit != g_static_vbs.end()) {
+            if (vit->second.buf) gl.glDeleteBuffers(1, &vit->second.buf);
+            g_static_vbs.erase(vit);
+        }
+    }
+    for (GpuTextureObj* t : texs) {
+        if (!t) continue;
+        if (t->gl_fbo) { gl.glDeleteFramebuffers(1, &t->gl_fbo); t->gl_fbo = 0; }
+        if (t->gl_rbo) { gl.glDeleteRenderbuffers(1, &t->gl_rbo); t->gl_rbo = 0; }
+        if (t->gl_tex) { glDeleteTextures(1, &t->gl_tex); t->gl_tex = 0; }
+        delete t;
+    }
+}
 
 GLuint g_msaa_fbo = 0, g_msaa_color_rbo = 0, g_msaa_ds_rbo = 0;
 GLuint g_resolve_fbo = 0, g_resolve_tex = 0;
@@ -75,7 +111,6 @@ int g_draw_skipped_shader = 0;
 int g_draw_skipped_vert = 0;
 double g_fps = 60.0;
 auto g_fps_t0 = std::chrono::steady_clock::now();
-auto g_frame_t0 = std::chrono::steady_clock::now();
 int g_fps_frames = 0;
 
 uint64_t hash_pair(uint64_t a, uint64_t b) {
@@ -251,9 +286,33 @@ void init_quad_and_white() {
         in vec2 v_uv; in vec4 v_col;
         layout(location=0) out vec4 FragColor;
         void main() {
-            vec4 c = texture(tx, v_uv);
-            vec3 bloom = max(c.rgb - 0.85, 0.0) * 0.25;
-            FragColor = vec4(clamp(c.rgb + bloom, 0.0, 1.0), 1.0);
+            vec2 ts = 1.0 / max(vec2(textureSize(tx, 0)), vec2(1.0));
+            vec3 cM = texture(tx, v_uv).rgb;
+            vec3 cN = texture(tx, v_uv + vec2(0.0, -ts.y)).rgb;
+            vec3 cS = texture(tx, v_uv + vec2(0.0,  ts.y)).rgb;
+            vec3 cW = texture(tx, v_uv + vec2(-ts.x, 0.0)).rgb;
+            vec3 cE = texture(tx, v_uv + vec2( ts.x, 0.0)).rgb;
+
+            vec3 mn = min(cM, min(min(cN, cS), min(cW, cE)));
+            vec3 mx = max(cM, max(max(cN, cS), max(cW, cE)));
+            vec3 amp = clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-5)), 0.0, 1.0);
+            vec3 w = -sqrt(amp) * 0.14;
+            vec3 sharp = (cM + (cN + cS + cW + cE) * w) / max(1.0 + 4.0 * w, vec3(0.05));
+            sharp = clamp(sharp, mn, mx);
+
+            vec3 b0 = texture(tx, v_uv + ts * vec2(-1.5, -1.5)).rgb
+                    + texture(tx, v_uv + ts * vec2( 1.5, -1.5)).rgb
+                    + texture(tx, v_uv + ts * vec2(-1.5,  1.5)).rgb
+                    + texture(tx, v_uv + ts * vec2( 1.5,  1.5)).rgb;
+            vec3 b1 = texture(tx, v_uv + ts * vec2( 0.0, -3.25)).rgb
+                    + texture(tx, v_uv + ts * vec2( 0.0,  3.25)).rgb
+                    + texture(tx, v_uv + ts * vec2(-3.25, 0.0)).rgb
+                    + texture(tx, v_uv + ts * vec2( 3.25, 0.0)).rgb;
+            vec3 bAvg = b0 * 0.15 + b1 * 0.10;
+            vec3 h = max(bAvg - 0.78, vec3(0.0));
+            vec3 glow = (h * h) / (h + 0.22);
+
+            FragColor = vec4(clamp(sharp + glow * 0.36, 0.0, 1.0), 1.0);
         }
     )";
     g_quad_prog_blit = compile_raw_prog(qvs, qps);
@@ -286,6 +345,52 @@ void init_quad_and_white() {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+static std::string gl_prog_cache_path(uint64_t key) {
+    if (g_cfg.cache_dir.empty()) return {};
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "glprog_%016llX.glbin", static_cast<unsigned long long>(key));
+    return (fs::path(g_cfg.cache_dir) / buf).string();
+}
+
+static bool load_gl_prog_binary(GLuint prog, const std::string& path) {
+    auto& gl = whacked_gl();
+    if (!gl.has_prog_binary || path.empty()) return false;
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) return false;
+    std::streamsize sz = f.tellg();
+    if (sz <= 12) return false;
+    f.seekg(0);
+    std::vector<uint8_t> buf(static_cast<size_t>(sz));
+    if (!f.read(reinterpret_cast<char*>(buf.data()), sz)) return false;
+    if (std::memcmp(buf.data(), "WGL1", 4) != 0) return false;
+    uint32_t fmt = 0;
+    std::memcpy(&fmt, buf.data() + 4, 4);
+    gl.glProgramBinary(prog, static_cast<GLenum>(fmt), buf.data() + 8, static_cast<GLsizei>(buf.size() - 8));
+    GLint ok = 0;
+    gl.glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    return ok == GL_TRUE;
+}
+
+static void save_gl_prog_binary(GLuint prog, const std::string& path) {
+    auto& gl = whacked_gl();
+    if (!gl.has_prog_binary || path.empty()) return;
+    GLint len = 0;
+    gl.glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &len);
+    if (len <= 0 || len > 16 * 1024 * 1024) return;
+    std::vector<uint8_t> data(static_cast<size_t>(len) + 8u);
+    std::memcpy(data.data(), "WGL1", 4);
+    GLenum fmt = 0;
+    GLsizei out_len = 0;
+    gl.glGetProgramBinary(prog, len, &out_len, &fmt, data.data() + 8);
+    if (out_len <= 0) return;
+    uint32_t ufmt = static_cast<uint32_t>(fmt);
+    std::memcpy(data.data() + 4, &ufmt, 4);
+    std::error_code ec;
+    fs::create_directories(fs::path(path).parent_path(), ec);
+    std::ofstream f(path, std::ios::binary);
+    if (f.is_open()) f.write(reinterpret_cast<const char*>(data.data()), 8 + out_len);
+}
+
 GLuint get_linked_program(const Nv2aCompiledVS* vs, const Nv2aCompiledPS* ps) {
     auto& gl = whacked_gl();
     uint64_t k = hash_pair(vs->key, ps->key);
@@ -293,18 +398,26 @@ GLuint get_linked_program(const Nv2aCompiledVS* vs, const Nv2aCompiledPS* ps) {
     if (it != g_prog_cache.end()) return it->second;
 
     GLuint prog = gl.glCreateProgram();
-    gl.glAttachShader(prog, vs->gl_vs);
-    gl.glAttachShader(prog, ps->gl_ps);
-    gl.glLinkProgram(prog);
-    GLint ok = 0;
-    gl.glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[1024]{};
-        gl.glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
-        std::fprintf(stderr, "[GL LINK ERR]: %s\n", log);
-        gl.glDeleteProgram(prog);
-        g_prog_cache[k] = 0;
-        return 0;
+    std::string bin_path = gl_prog_cache_path(k);
+    bool linked = load_gl_prog_binary(prog, bin_path);
+    if (!linked) {
+        if (gl.has_prog_binary && gl.glProgramParameteri) {
+            gl.glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        }
+        gl.glAttachShader(prog, vs->gl_vs);
+        gl.glAttachShader(prog, ps->gl_ps);
+        gl.glLinkProgram(prog);
+        GLint ok = 0;
+        gl.glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[1024]{};
+            gl.glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+            std::fprintf(stderr, "[GL LINK ERR]: %s\n", log);
+            gl.glDeleteProgram(prog);
+            g_prog_cache[k] = 0;
+            return 0;
+        }
+        save_gl_prog_binary(prog, bin_path);
     }
 
     auto bind_ubo = [&](const char* name, GLuint binding) {
@@ -459,6 +572,7 @@ void gl_release_context() {
 
 void gl_shutdown() {
     ensure_gl_current();
+    drain_retired_gl_resources();
     ui_shutdown();
     nv2a_shaders_shutdown();
     auto& gl = whacked_gl();
@@ -527,8 +641,8 @@ void gl_clear(uint32_t flags, uint32_t color_argb, float z, uint32_t stencil, Gp
                      ((color_argb >> 24) & 0xFF) / 255.0f);
         mask |= GL_COLOR_BUFFER_BIT;
     }
-    if ((flags & 2u) && !custom_rt) { glClearDepth(std::clamp(z, 0.0f, 1.0f)); mask |= GL_DEPTH_BUFFER_BIT; }
-    if ((flags & 4u) && !custom_rt) { glClearStencil(static_cast<GLint>(stencil & 0xFFu)); mask |= GL_STENCIL_BUFFER_BIT; }
+    if ((flags & 2u) && (!custom_rt || custom_rt->gl_rbo)) { glClearDepth(std::clamp(z, 0.0f, 1.0f)); mask |= GL_DEPTH_BUFFER_BIT; }
+    if ((flags & 4u) && (!custom_rt || custom_rt->gl_rbo)) { glClearStencil(static_cast<GLint>(stencil & 0xFFu)); mask |= GL_STENCIL_BUFFER_BIT; }
     if (mask) glClear(mask);
 }
 
@@ -627,7 +741,8 @@ void gl_draw(const DrawStateSnapshot& st) {
     glColorMask((st.color_write_mask & 1) != 0, (st.color_write_mask & 2) != 0,
                 (st.color_write_mask & 4) != 0, (st.color_write_mask & 8) != 0);
 
-    if (st.z_enable && !to_rt) {
+    bool has_ds = !to_rt || (st.custom_rt && st.custom_rt->gl_rbo != 0);
+    if (st.z_enable && has_ds) {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(gl_cmp(st.z_func));
         glDepthMask(st.z_write ? GL_TRUE : GL_FALSE);
@@ -636,7 +751,7 @@ void gl_draw(const DrawStateSnapshot& st) {
         glDepthMask(GL_FALSE);
     }
 
-    if (st.stencil_enable && !to_rt) {
+    if (st.stencil_enable && has_ds) {
         glEnable(GL_STENCIL_TEST);
         glStencilFunc(gl_cmp(st.stencil_func), static_cast<GLint>(st.stencil_ref & 0xFFu), st.stencil_mask & 0xFFu);
         glStencilOp(gl_stencil_op(st.stencil_fail), gl_stencil_op(st.stencil_zfail), gl_stencil_op(st.stencil_pass));
@@ -672,10 +787,8 @@ void gl_draw(const DrawStateSnapshot& st) {
         gl.glBindSampler(s, get_sampler(st.addr_u[s], st.addr_v[s], st.min_filter[s], st.mag_filter[s]));
     }
 
-    bool guest_is_16x9 = (st.xb_fb_w / std::max(1.0f, st.xb_fb_h)) > 1.5f;
-    float target_asp = static_cast<float>(rt_w) / std::max(1.0f, static_cast<float>(rt_h));
-    float ws = (g_cfg.widescreen && !guest_is_16x9) ? ((4.0f / 3.0f) / std::max(0.5f, target_asp)) : 1.0f;
-    float ui_ws = (!guest_is_16x9 && g_cfg.unstretched_hud) ? ws : 1.0f;
+    GfxTransformParams tp = gfx_compute_transform_params(st, static_cast<float>(rt_w), static_cast<float>(rt_h),
+                                                       g_cfg.widescreen, g_cfg.unstretched_hud);
     float y_flip = to_rt ? -1.0f : 1.0f;
 
     gl.glUseProgram(prog);
@@ -684,7 +797,7 @@ void gl_draw(const DrawStateSnapshot& st) {
         gl.glBufferSubData(GL_UNIFORM_BUFFER, 0, 192 * 16, st.vs_consts);
         gl.glBindBufferBase(GL_UNIFORM_BUFFER, 0, g_ubo_vs_nv2a);
 
-        float sc[8] = {st.xb_fb_w, st.xb_fb_h, st.vs->is_screenspace ? ui_ws : ws, st.vs->is_screenspace ? 1.0f : 0.0f, y_flip, 0, 0, 0};
+        float sc[8] = {tp.ss_w, tp.ss_h, tp.scale_x, st.vs->is_screenspace ? 1.0f : 0.0f, y_flip, 0, 0, 0};
         gl.glBindBuffer(GL_UNIFORM_BUFFER, g_ubo_vs_scr);
         gl.glBufferSubData(GL_UNIFORM_BUFFER, 0, 32, sc);
         gl.glBindBufferBase(GL_UNIFORM_BUFFER, 1, g_ubo_vs_scr);
@@ -706,8 +819,8 @@ void gl_draw(const DrawStateSnapshot& st) {
         std::memcpy(d + 132, st.light_atten, 64);
         d[148] = st.fog_enable ? 1.0f : 0.0f;
         d[149] = st.fog_start; d[150] = st.fog_end; d[151] = st.fog_density;
-        d[152] = st.xb_fb_w; d[153] = st.xb_fb_h;
-        d[154] = st.vs->is_screenspace ? ui_ws : ws;
+        d[152] = tp.ss_w; d[153] = tp.ss_h;
+        d[154] = tp.scale_x;
         d[155] = st.lighting_en ? 1.0f : 0.0f;
         d[156] = st.specular_en ? 1.0f : 0.0f;
         d[157] = y_flip; d[158] = 1.0f; d[159] = static_cast<float>(st.fog_mode);
@@ -919,6 +1032,7 @@ void gl_blit_rgba_rect(const void* bgra, int src_w, int src_h, int dst_x, int ds
 void gl_present() {
     if (!g_sdl_win || !g_gl_ctx) return;
     ensure_gl_current();
+    drain_retired_gl_resources();
     int pw = g_pending_resize_w.exchange(0);
     int ph = g_pending_resize_h.exchange(0);
     if (pw > 0 && ph > 0) create_targets(pw, ph);
@@ -991,16 +1105,45 @@ void gl_present() {
     g_draw_skipped_shader = 0;
     g_draw_skipped_vert = 0;
 
-    if (g_cfg.fps_cap > 0 && !g_cfg.vsync) {
-        double target_ms = 1000.0 / g_cfg.fps_cap;
-        double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_frame_t0).count();
-        if (elapsed_ms + 1.5 < target_ms) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(target_ms - elapsed_ms)));
-        }
-    }
-    g_frame_t0 = std::chrono::steady_clock::now();
+    gfx_pace_frame(g_cfg.fps_cap);
 }
 
 void gl_request_screenshot(const std::string& filename) {
     g_pending_screenshot = filename;
+}
+
+void gl_retire_texture(GpuTextureObj* tex) {
+    if (!tex) return;
+    std::lock_guard<std::mutex> lk(g_gl_retire_mtx);
+    g_gl_retired_textures.push_back(tex);
+}
+
+void gl_retire_buffer(uint32_t obj_va) {
+    if (!obj_va) return;
+    std::lock_guard<std::mutex> lk(g_gl_retire_mtx);
+    g_gl_retired_buffers.push_back(obj_va);
+}
+
+void* gl_create_ui_texture_rgba(const uint8_t* rgba, int w, int h) {
+    if (!rgba || w <= 0 || h <= 0 || !g_gl_ctx) return nullptr;
+    ensure_gl_current();
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    if (!tex) return nullptr;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(tex));
+}
+
+void gl_destroy_ui_texture(void* tex_handle) {
+    if (!tex_handle || !g_gl_ctx) return;
+    ensure_gl_current();
+    GLuint tex = static_cast<GLuint>(reinterpret_cast<uintptr_t>(tex_handle));
+    if (tex) glDeleteTextures(1, &tex);
 }

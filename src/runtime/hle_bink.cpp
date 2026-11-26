@@ -13,6 +13,7 @@ using ProcHandle = pid_t;
 using PipeHandle = int;
 #endif
 #include "hle_common.h"
+#include "launcher_ui.h"
 #include "xiso_vfs.h"
 #include <algorithm>
 #include <atomic>
@@ -44,6 +45,7 @@ struct BinkStreamState {
     uint32_t cur_frame = 1; // 1-based
     double   fps = 29.97;
     bool     has_alpha = false;
+    bool     has_audio = false;
     bool     video_on = true;
     bool     sound_on = true;
     bool     paused = false;
@@ -84,12 +86,28 @@ std::atomic<uint32_t> g_bink_id{1};
 
 std::string find_ffmpeg() {
 #ifdef _WIN32
+    char exe_buf[MAX_PATH]{};
+    if (GetModuleFileNameA(nullptr, exe_buf, MAX_PATH) > 0) {
+        fs::path ed = fs::path(exe_buf).parent_path();
+        for (const fs::path& cand : {ed / "ffmpeg.exe", ed / "bin" / "ffmpeg.exe"}) {
+            std::error_code ec;
+            if (fs::exists(cand, ec)) return cand.string();
+        }
+    }
     char buf[MAX_PATH]{};
     if (SearchPathA(nullptr, "ffmpeg.exe", nullptr, MAX_PATH, buf, nullptr)) {
         return std::string(buf);
     }
     return "ffmpeg.exe";
 #else
+    std::error_code ec;
+    fs::path self = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec && self.has_parent_path()) {
+        fs::path ed = self.parent_path();
+        for (const fs::path& cand : {ed / "ffmpeg", ed / "bin" / "ffmpeg"}) {
+            if (::access(cand.c_str(), X_OK) == 0) return cand.string();
+        }
+    }
     const char* candidates[] = {"/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"};
     for (const char* c : candidates) {
         if (::access(c, X_OK) == 0) return c;
@@ -254,10 +272,22 @@ void start_ffmpeg_decoders(BinkStreamState* s, double start_sec = 0.0) {
                 s->frame_cv.notify_all();
             }
         });
+    } else {
+        {
+            std::lock_guard<std::mutex> lk(s->frame_mtx);
+            s->eof_reached = true;
+            s->frame_cv.notify_all();
+        }
+        static std::atomic<bool> s_warned{false};
+        if (!s_warned.exchange(true)) {
+            std::fprintf(stderr, "[BINK] Warning: ffmpeg not found (%s); FMV playback skipped cleanly.\n", find_ffmpeg().c_str());
+            hle_log_note("[BINK] Warning: ffmpeg not found (%s); FMV playback skipped cleanly.", find_ffmpeg().c_str());
+            ui_show_toast("ffmpeg not found: FMV videos skipped cleanly.", 5.0);
+        }
     }
 
-    // Audio s16le stereo 44100 Hz pipe (skip for 1-frame still Binks)
-    if (s->total_frames > 1) {
+    // Audio s16le stereo 44100 Hz pipe (skip silent Binks cleanly)
+    if (s->total_frames > 1 && s->has_audio) {
         std::vector<std::string> aargs = base_args;
         aargs.insert(aargs.end(), {"-vn", "-f", "s16le", "-ac", "2", "-ar", "44100", "-"});
         if (spawn_ffmpeg_pipe(aargs, s->aud_proc, s->aud_pipe)) {
@@ -391,6 +421,8 @@ void hle_BinkOpen(CpuContext& ctx) {
     s->fps          = (fps_n && fps_d) ? (static_cast<double>(fps_n) / fps_d) : 29.97;
     if (s->fps < 5.0 || s->fps > 120.0) s->fps = 29.97;
     s->has_alpha    = ((u32le(0x24) & 0x00100000u) != 0) || ((flags & 0x00100000u) != 0);
+    uint32_t num_audio = (bik_bytes.size() >= 0x2C) ? u32le(0x28) : 0u;
+    s->has_audio    = (num_audio > 0 && num_audio <= 16u);
     uint64_t total_raw_bytes = static_cast<uint64_t>(s->width) * s->height * 4ull * s->total_frames;
     s->cache_enabled = (total_raw_bytes <= 24ull * 1024ull * 1024ull);
 
@@ -606,6 +638,21 @@ void hle_BinkSetSoundOnOff(CpuContext& ctx)   {
 }
 
 } // namespace
+
+void hle_bink_shutdown() {
+    std::vector<BinkStreamState*> rem;
+    {
+        std::lock_guard<std::mutex> lk(g_bink_mtx);
+        for (auto& kv : g_binks) rem.push_back(kv.second);
+        g_binks.clear();
+    }
+    for (BinkStreamState* s : rem) {
+        if (s) {
+            stop_ffmpeg_decoders(s, true);
+            delete s;
+        }
+    }
+}
 
 void hle_register_bink() {
     std::string zdir = XisoVfs::instance().host_path_for("Z", "");

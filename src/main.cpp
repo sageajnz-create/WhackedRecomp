@@ -25,6 +25,7 @@
 #include "runtime/net_lobby.h"
 #include "runtime/cpu_context.h"
 #include "runtime/xbox_mem.h"
+#include "rl_achievements.h"
 
 #include <algorithm>
 #include <atomic>
@@ -50,7 +51,7 @@ extern void hle_input_poll_ui_snapshot();
 
 namespace {
 
-constexpr const char* kAppVersion = "1.0.1";
+constexpr const char* kAppVersion = "1.0.2";
 
 SDL_Window* g_sdl_win = nullptr;
 std::atomic<bool> g_quit_requested{false};
@@ -68,6 +69,10 @@ void log_note(const char* fmt, ...) {
     std::lock_guard<std::mutex> lk(g_log_mtx);
     std::ofstream f(g_log_path, std::ios::app);
     if (f.is_open()) f << buf << "\n";
+}
+
+void log_sink_raw(const char* line) {
+    if (line) log_note("%s", line);
 }
 
 void init_rotating_log(const std::string& userdata_root) {
@@ -250,8 +255,10 @@ LONG WINAPI crash_handler(EXCEPTION_POINTERS* ep) {
         const char* nm = SymFromAddr(proc, a, &sd, sym) ? sym->Name : "??";
         if (SymGetLineFromAddr64(proc, a, &disp, &line)) {
             std::fprintf(stderr, "  #%02u %s + 0x%llX (%s:%lu)\n", i, nm, sd, line.FileName, line.LineNumber);
+            log_note("  #%02u %s + 0x%llX (%s:%lu)", i, nm, sd, line.FileName, line.LineNumber);
         } else {
             std::fprintf(stderr, "  #%02u %s + 0x%llX (0x%llX)\n", i, nm, sd, a);
+            log_note("  #%02u %s + 0x%llX (0x%llX)", i, nm, sd, a);
         }
     }
     std::fflush(stderr);
@@ -374,6 +381,7 @@ int app_main(int argc, char** argv) {
     fs::path exe_dir = get_exe_dir(argc > 0 ? argv[0] : nullptr);
     std::string userdata_root = resolve_userdata_root(cli_data, argc > 0 ? argv[0] : nullptr);
     init_rotating_log(userdata_root);
+    hle_set_log_sink(log_sink_raw);
 
     bool had_config = app_config_load(userdata_root);
     auto& cfg = app_config();
@@ -391,6 +399,7 @@ int app_main(int argc, char** argv) {
     bool cli_force_launcher = false;
     bool cli_auto_script = false;
     bool cli_fullscreen_set = false;
+    bool cli_gfx_override = false;
     int cli_host_port = 0;
     std::string cli_join_code;
 
@@ -398,18 +407,18 @@ int app_main(int argc, char** argv) {
         std::string a = argv[i];
         if ((a == "--iso" || a == "--game") && i + 1 < argc) cli_iso = argv[++i];
         else if ((a == "--data" || a == "--userdata" || a == "--portable-dir") && i + 1 < argc) ++i;
-        else if (a == "--width" && i + 1 < argc) cfg.width = std::atoi(argv[++i]);
-        else if (a == "--height" && i + 1 < argc) cfg.height = std::atoi(argv[++i]);
-        else if (a == "--widescreen" && i + 1 < argc) cfg.widescreen = (std::atoi(argv[++i]) != 0);
-        else if (a == "--hd720" && i + 1 < argc) cfg.hd720 = (std::atoi(argv[++i]) != 0);
-        else if (a == "--unstretched-hud" && i + 1 < argc) cfg.unstretched_hud = (std::atoi(argv[++i]) != 0);
-        else if (a == "--msaa" && i + 1 < argc) cfg.msaa_4x = (std::atoi(argv[++i]) != 0);
-        else if (a == "--af" && i + 1 < argc) cfg.aniso_16x = (std::atoi(argv[++i]) != 0);
-        else if (a == "--bloom" && i + 1 < argc) cfg.bloom_sharpen = (std::atoi(argv[++i]) != 0);
-        else if (a == "--vsync" && i + 1 < argc) cfg.vsync = (std::atoi(argv[++i]) != 0);
-        else if (a == "--fps-cap" && i + 1 < argc) cfg.fps_cap = std::atoi(argv[++i]);
-        else if (a == "--fullscreen" && i + 1 < argc) { cfg.fullscreen = (std::atoi(argv[++i]) != 0); cli_fullscreen_set = true; }
-        else if (a == "--renderer" && i + 1 < argc) cfg.renderer = argv[++i];
+        else if (a == "--width" && i + 1 < argc) { cfg.width = std::atoi(argv[++i]); cli_gfx_override = true; }
+        else if (a == "--height" && i + 1 < argc) { cfg.height = std::atoi(argv[++i]); cli_gfx_override = true; }
+        else if (a == "--widescreen" && i + 1 < argc) { cfg.widescreen = (std::atoi(argv[++i]) != 0); cli_gfx_override = true; }
+        else if (a == "--hd720" && i + 1 < argc) { cfg.hd720 = (std::atoi(argv[++i]) != 0); cli_gfx_override = true; }
+        else if (a == "--unstretched-hud" && i + 1 < argc) { cfg.unstretched_hud = (std::atoi(argv[++i]) != 0); cli_gfx_override = true; }
+        else if (a == "--msaa" && i + 1 < argc) { cfg.msaa_4x = (std::atoi(argv[++i]) != 0); cli_gfx_override = true; }
+        else if (a == "--af" && i + 1 < argc) { cfg.aniso_16x = (std::atoi(argv[++i]) != 0); cli_gfx_override = true; }
+        else if (a == "--bloom" && i + 1 < argc) { cfg.bloom_sharpen = (std::atoi(argv[++i]) != 0); cli_gfx_override = true; }
+        else if (a == "--vsync" && i + 1 < argc) { cfg.vsync = (std::atoi(argv[++i]) != 0); cli_gfx_override = true; }
+        else if (a == "--fps-cap" && i + 1 < argc) { cfg.fps_cap = std::atoi(argv[++i]); cli_gfx_override = true; }
+        else if (a == "--fullscreen" && i + 1 < argc) { cfg.fullscreen = (std::atoi(argv[++i]) != 0); cli_fullscreen_set = true; cli_gfx_override = true; }
+        else if (a == "--renderer" && i + 1 < argc) { cfg.renderer = argv[++i]; cli_gfx_override = true; }
         else if (a == "--launcher") cli_force_launcher = true;
         else if (a == "--no-launcher") cli_no_launcher = true;
         else if (a == "--host" && i + 1 < argc) cli_host_port = std::atoi(argv[++i]);
@@ -487,6 +496,7 @@ int app_main(int argc, char** argv) {
     }
 
     SDL_SetMainReady();
+    SDL_SetHint("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
 #ifndef _WIN32
     if (void* x11 = ::dlopen("libX11.so.6", RTLD_LAZY | RTLD_GLOBAL)) {
         using XInitThreadsFn = int (*)();
@@ -646,6 +656,32 @@ int app_main(int argc, char** argv) {
     recomp_register_all();
     gfx_release_context_for_game();
 
+    rl_ach_set_info("whackedrecomp", kAppVersion);
+    rl_ach_on_unlock([](uint32_t, void*) {
+        if (!rl_ach_quiet_toasts()) {
+            ui_show_toast("Achievement Unlocked!", 4.0);
+        }
+    }, nullptr);
+    rl_ach_init("xbox", [](uint32_t addr, uint8_t* buf, uint32_t sz, void*) -> uint32_t {
+        if (!g_xbox_mem_base || !buf || sz == 0 || addr >= XBOX_MEM_SIZE) return 0;
+        uint32_t avail = std::min(sz, XBOX_MEM_SIZE - addr);
+        uint32_t copied = 0;
+        if (addr < 0x1000u) {
+            uint32_t z = std::min(avail, 0x1000u - addr);
+            std::memset(buf, 0, z);
+            copied += z;
+            addr += z;
+            buf += z;
+            avail -= z;
+        }
+        if (avail > 0) {
+            std::memcpy(buf, mem_ptr(addr), avail);
+            copied += avail;
+        }
+        return copied;
+    }, nullptr);
+    rl_ach_presence("Starting Whacked!");
+
     uint32_t stack_size = 0x00200000u;
     uint32_t stack_base = xbox_guest_alloc(stack_size, 4096u, true);
     uint32_t teb0 = xbox_alloc_teb(stack_base + stack_size, stack_base, 0x400u, 1);
@@ -682,8 +718,14 @@ int app_main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
 
+    if (!cli_gfx_override && g_max_frames == 0 && !cli_auto_script && g_shot_launcher_path.empty() &&
+        g_shot_overlay_path.empty() && g_final_shot_path.empty()) {
+        app_config_save(userdata_root);
+    }
     log_note("[BOOT] Clean shutdown");
     if (entry_thr.joinable()) entry_thr.detach();
+    hle_bink_shutdown();
+    rl_ach_shutdown();
     hle_kernel_shutdown();
     net_shutdown();
     audio_shutdown();

@@ -18,6 +18,12 @@
 #define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
 #define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT 0x84FF
 #endif
+#ifndef GL_PROGRAM_BINARY_RETRIEVABLE_HINT
+#define GL_PROGRAM_BINARY_RETRIEVABLE_HINT 0x8257
+#endif
+#ifndef GL_PROGRAM_BINARY_LENGTH
+#define GL_PROGRAM_BINARY_LENGTH 0x8741
+#endif
 
 // Minimal cross-platform OpenGL 3.3 Core function table loaded via SDL_GL_GetProcAddress
 #define WHACKED_GL_LIST(X) \
@@ -82,9 +88,13 @@ struct WhackedGLProcs {
 #define DECLARE_GL(type, name) type name = nullptr;
     WHACKED_GL_LIST(DECLARE_GL)
 #undef DECLARE_GL
+    PFNGLGETPROGRAMBINARYPROC  glGetProgramBinary = nullptr;
+    PFNGLPROGRAMBINARYPROC     glProgramBinary = nullptr;
+    PFNGLPROGRAMPARAMETERIPROC glProgramParameteri = nullptr;
     bool loaded = false;
     bool has_s3tc = false;
     bool has_aniso = false;
+    bool has_prog_binary = false;
 };
 
 inline WhackedGLProcs& whacked_gl() {
@@ -101,6 +111,10 @@ inline bool whacked_gl_load() {
     if (!g.name) ok = false;
     WHACKED_GL_LIST(LOAD_GL)
 #undef LOAD_GL
+    g.glGetProgramBinary  = reinterpret_cast<PFNGLGETPROGRAMBINARYPROC>(SDL_GL_GetProcAddress("glGetProgramBinary"));
+    g.glProgramBinary     = reinterpret_cast<PFNGLPROGRAMBINARYPROC>(SDL_GL_GetProcAddress("glProgramBinary"));
+    g.glProgramParameteri = reinterpret_cast<PFNGLPROGRAMPARAMETERIPROC>(SDL_GL_GetProcAddress("glProgramParameteri"));
+    g.has_prog_binary = (g.glGetProgramBinary != nullptr && g.glProgramBinary != nullptr);
     g.has_s3tc = SDL_GL_ExtensionSupported("GL_EXT_texture_compression_s3tc") != SDL_FALSE;
     g.has_aniso = SDL_GL_ExtensionSupported("GL_EXT_texture_filter_anisotropic") != SDL_FALSE;
     g.loaded = ok;

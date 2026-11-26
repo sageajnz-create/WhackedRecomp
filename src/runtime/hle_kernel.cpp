@@ -27,10 +27,12 @@
 #endif
 #include "hle_common.h"
 #include "xiso_vfs.h"
+#include "rl_achievements.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -317,6 +319,7 @@ struct KernelObj {
     // File state
     bool is_iso = false;
     bool is_dir = false;
+    bool delete_on_close = false;
     const XisoEntry* iso_entry = nullptr;
     std::string dev;
     std::string rel_path;
@@ -475,6 +478,11 @@ static thread_local uint32_t tl_tid = 0;
 static HleTraceEntry g_trace_ring[64]{};
 static uint32_t g_trace_write_idx = 0;
 static std::atomic<uint64_t> g_kernel_tick_activity{0};
+static void (*g_log_sink)(const char*) = nullptr;
+
+static void emit_log_sink(const char* msg) {
+    if (g_log_sink && msg) g_log_sink(msg);
+}
 
 static void wait_if_self_suspended() {
     ThreadControl* tc = tl_self_ctrl;
@@ -500,30 +508,50 @@ static void record_hle_op(const CpuContext& ctx, const char* op, uint32_t a0 = 0
 }
 
 } // namespace
+void hle_set_log_sink(void (*sink)(const char*)) {
+    g_log_sink = sink;
+}
+void hle_log_note(const char* fmt, ...) {
+    char buf[1024]{};
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    emit_log_sink(buf);
+}
 void hle_kernel_notify_frame() {
     g_kernel_tick_activity.fetch_add(1, std::memory_order_relaxed);
 }
 void hle_kernel_dump_stall_state() {
     std::lock_guard<std::mutex> lk(g_diag_mtx);
-    std::printf("\n=== [STALL WATCHDOG DUMP] active_threads=%zu ===\n", g_guest_threads.size());
+    char line[512]{};
+    std::snprintf(line, sizeof(line), "=== [STALL WATCHDOG DUMP] active_threads=%zu ===", g_guest_threads.size());
+    std::printf("\n%s\n", line);
+    emit_log_sink(line);
     for (auto* t : g_guest_threads) {
         if (!t || !t->ctx) continue;
         uint32_t esp = t->ctx->esp;
         uint32_t s0 = mem_ptr(esp) ? rd32(esp) : 0;
         uint32_t s1 = mem_ptr(esp + 4u) ? rd32(esp + 4u) : 0;
         uint32_t s2 = mem_ptr(esp + 8u) ? rd32(esp + 8u) : 0;
-        std::printf("  TID=%-3u last_pc=0x%08X esp=0x%08X [sp]={0x%08X,0x%08X,0x%08X} eax=0x%08X wait=%s(0x%X, ms=%u)\n",
-                    t->tid, t->ctx->last_pc, esp, s0, s1, s2, t->ctx->eax,
-                    t->wait_op ? t->wait_op : "running", t->wait_arg, t->wait_ms);
+        std::snprintf(line, sizeof(line),
+                      "  TID=%-3u last_pc=0x%08X esp=0x%08X [sp]={0x%08X,0x%08X,0x%08X} eax=0x%08X wait=%s(0x%X, ms=%u)",
+                      t->tid, t->ctx->last_pc, esp, s0, s1, s2, t->ctx->eax,
+                      t->wait_op ? t->wait_op : "running", t->wait_arg, t->wait_ms);
+        std::printf("%s\n", line);
+        emit_log_sink(line);
     }
     std::printf("--- Last HLE Trace Ring (oldest -> newest) ---\n");
     uint32_t start = (g_trace_write_idx >= 32u) ? (g_trace_write_idx - 32u) : 0u;
     for (uint32_t i = start; i < g_trace_write_idx; ++i) {
         const auto& e = g_trace_ring[i & 63u];
-        std::printf("  [%u] tid=%u pc=0x%08X %-28s a0=0x%08X a1=0x%08X\n",
-                    i, e.tid, e.last_pc, e.op, e.arg0, e.arg1);
+        std::snprintf(line, sizeof(line), "  [%u] tid=%u pc=0x%08X %-28s a0=0x%08X a1=0x%08X",
+                      i, e.tid, e.last_pc, e.op, e.arg0, e.arg1);
+        std::printf("%s\n", line);
+        emit_log_sink(line);
     }
     std::printf("=== END STALL DUMP ===\n");
+    emit_log_sink("=== END STALL DUMP ===");
     std::fflush(stdout);
 }
 
@@ -559,7 +587,7 @@ void hle_RtlLeaveCriticalSection(CpuContext& ctx) {
 void hle_NtCreateEvent(CpuContext& ctx) {
     uint32_t ph = hle_arg(ctx, 0);
     uint32_t type = hle_arg(ctx, 2); // 0=Notification(manual), 1=Synchronization(auto)
-    uint32_t init = hle_arg(ctx, 3);
+    uint32_t init = hle_arg(ctx, 3) & 0xFFu;
     HostSync ev = host_create_event(type == 0, init != 0);
     auto* obj = new KernelObj();
     obj->kind = ObjKind::SyncHandle;
@@ -636,7 +664,7 @@ void hle_NtReleaseSemaphore(CpuContext& ctx) {
 
 void hle_NtCreateMutant(CpuContext& ctx) {
     uint32_t ph = hle_arg(ctx, 0);
-    uint32_t init = hle_arg(ctx, 2);
+    uint32_t init = hle_arg(ctx, 2) & 0xFFu;
     auto* obj = new KernelObj();
     obj->kind = ObjKind::SyncHandle;
     obj->sync_handle = host_create_mutex(init != 0);
@@ -786,9 +814,10 @@ void hle_KeCancelTimer(CpuContext& ctx) {
 }
 void hle_NtCreateTimer(CpuContext& ctx) {
     uint32_t ph = hle_arg(ctx, 0);
+    uint32_t timer_type = hle_arg(ctx, 3); // 0=Notification, 1=Synchronization
     auto* obj = new KernelObj();
     obj->kind = ObjKind::SyncHandle;
-    obj->sync_handle = host_create_event(true, false);
+    obj->sync_handle = host_create_event(timer_type == 0, false);
     if (ph) wr32(ph, alloc_handle(obj));
     hle_ret_u32(ctx, STATUS_SUCCESS_XB, 12);
 }
@@ -968,11 +997,14 @@ static uint32_t open_file_common(uint32_t ph, uint32_t obj_attr_va, uint32_t io_
 
     // Writable host storage (T:\, U:\, Z:\)
     std::string host = XisoVfs::instance().host_path_for(dev, rel);
-    bool want_dir = (options & 0x01u) != 0;
+    std::error_code ec;
+    bool delete_on_close = (options & 0x1000u) != 0; // FILE_DELETE_ON_CLOSE
+    bool non_dir_only = (options & 0x0040u) != 0;    // FILE_NON_DIRECTORY_FILE
+    bool want_dir = (options & 0x01u) != 0 || (!non_dir_only && fs::is_directory(host, ec));
     if (want_dir) {
         if (create_mode && (disp == 2 || disp == 3 || disp == 5)) {
-            fs::create_directories(host);
-        } else if (!fs::exists(host)) {
+            fs::create_directories(host, ec);
+        } else if (!fs::exists(host, ec)) {
             if (io_sb_va) { wr32(io_sb_va, STATUS_OBJECT_NAME_NOT_FOUND_XB); wr32(io_sb_va + 4, 0); }
             return STATUS_OBJECT_NAME_NOT_FOUND_XB;
         }
@@ -980,6 +1012,7 @@ static uint32_t open_file_common(uint32_t ph, uint32_t obj_attr_va, uint32_t io_
         obj->kind = ObjKind::File;
         obj->is_iso = false;
         obj->is_dir = true;
+        obj->delete_on_close = delete_on_close;
         obj->dev = dev;
         obj->rel_path = rel;
         uint32_t h = alloc_handle(obj);
@@ -1036,6 +1069,7 @@ static uint32_t open_file_common(uint32_t ph, uint32_t obj_attr_va, uint32_t io_
     auto* obj = new KernelObj();
     obj->kind = ObjKind::File;
     obj->is_iso = false;
+    obj->delete_on_close = delete_on_close;
     obj->dev = dev;
     obj->rel_path = rel;
     obj->host_handle = fh;
@@ -1104,6 +1138,14 @@ void hle_NtReadFile(CpuContext& ctx) {
 #endif
     }
     if (io_sb) { wr32(io_sb, st); wr32(io_sb + 4, got); }
+    if (st == STATUS_SUCCESS_XB && got >= 32 && !obj->is_iso && !obj->is_dir && obj->dev == "U") {
+        static std::atomic<uint64_t> s_last_save_ms{0};
+        uint64_t now_ms = host_ticks_ms();
+        uint64_t prev_ms = s_last_save_ms.load(std::memory_order_relaxed);
+        if (now_ms - prev_ms > 2000 && s_last_save_ms.compare_exchange_weak(prev_ms, now_ms)) {
+            rl_ach_save_loaded();
+        }
+    }
     hle_ret_u32(ctx, st, 32);
 }
 
@@ -1190,9 +1232,12 @@ void hle_NtSetInformationFile(CpuContext& ctx) {
         hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 20);
         return;
     }
-    if (cls == 14 && info) { // FilePositionInformation
+    if (cls == 13 && info && !obj->is_iso) { // FileDispositionInformation
+        obj->delete_on_close = (rd8(info) != 0);
+    } else if (cls == 14 && info) { // FilePositionInformation
         obj->file_pos = rd64(info);
-    } else if (cls == 19 && info && !obj->is_iso && obj->host_handle != HOST_INVALID_FILE) { // FileEndOfFileInformation
+    } else if ((cls == 19 || cls == 20) && info && !obj->is_iso && obj->host_handle != HOST_INVALID_FILE) {
+        // FileAllocationInformation(19) / FileEndOfFileInformation(20)
 #ifdef _WIN32
         LARGE_INTEGER li{}; li.QuadPart = static_cast<LONGLONG>(rd64(info));
         SetFilePointerEx(obj->host_handle, li, nullptr, FILE_BEGIN);
@@ -1435,7 +1480,10 @@ void hle_NtQueryDirectoryFile(CpuContext& ctx) {
     uint32_t buf = hle_arg(ctx, 5);
     uint32_t len = hle_arg(ctx, 6);
     uint32_t fn_str_va = hle_arg(ctx, 8);
-    uint32_t restart = hle_arg(ctx, 9);
+    // NT BOOLEAN parameters only define the low byte; upper stack bytes can hold garbage.
+    bool return_single = (hle_arg(ctx, 7) & 0xFFu) != 0;
+    bool restart = (hle_arg(ctx, 9) & 0xFFu) != 0;
+    (void)return_single;
     auto* obj = get_handle(h);
     if (!obj || obj->kind != ObjKind::File) {
         hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 40);
@@ -1542,23 +1590,31 @@ void hle_NtDeleteFile(CpuContext& ctx) {
 void hle_NtFlushBuffersFile(CpuContext& ctx) { hle_ret_u32(ctx, STATUS_SUCCESS_XB, 8); }
 void hle_NtClose(CpuContext& ctx) {
     uint32_t h = hle_arg(ctx, 0);
-    std::lock_guard<std::mutex> lk(g_krnl_mtx);
-    auto it = g_handles.find(h);
-    if (it != g_handles.end()) {
-        KernelObj* o = it->second;
+    KernelObj* o = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_krnl_mtx);
+        auto it = g_handles.find(h);
+        if (it != g_handles.end()) {
+            o = it->second;
+            g_handles.erase(it);
+        }
+    }
+    if (o) {
+        bool del = (o->kind == ObjKind::File) && o->delete_on_close && !o->is_iso && !o->dev.empty();
+        std::string del_path = del ? XisoVfs::instance().host_path_for(o->dev, o->rel_path) : std::string{};
 #ifdef _WIN32
         if (o->host_handle != HOST_INVALID_FILE) CloseHandle(o->host_handle);
 #else
         if (o->host_handle != HOST_INVALID_FILE) ::close(o->host_handle);
 #endif
         if (o->sync_handle && o->kind != ObjKind::Thread) host_close_sync(o->sync_handle);
-        g_handles.erase(it);
-        // keep thr detached if running
         delete o;
-        hle_ret_u32(ctx, STATUS_SUCCESS_XB, 4);
-    } else {
-        hle_ret_u32(ctx, STATUS_SUCCESS_XB, 4);
+        if (del && !del_path.empty()) {
+            std::error_code ec;
+            fs::remove(del_path, ec);
+        }
     }
+    hle_ret_u32(ctx, STATUS_SUCCESS_XB, 4);
 }
 
 void hle_IoCreateSymbolicLink(CpuContext& ctx) {
@@ -1667,9 +1723,13 @@ void hle_PsCreateSystemThreadEx(CpuContext& ctx) {
             g_guest_threads.erase(
                 std::remove(g_guest_threads.begin(), g_guest_threads.end(), &gts),
                 g_guest_threads.end());
+            g_thr_by_handle.erase(h);
+            g_thr_by_tid.erase(tid);
         }
         tl_thread_state = nullptr;
         tl_self_ctrl = nullptr;
+        xbox_free_teb(teb_va);
+        xbox_guest_free(stack_base);
         host_set_event(done_ev);
     });
     obj->thr->detach();

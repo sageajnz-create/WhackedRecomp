@@ -55,14 +55,29 @@ struct AutoInputEvt {
 std::vector<AutoInputEvt> g_auto_inputs;
 std::atomic<uint64_t> g_auto_frame{0};
 
-int16_t apply_radial_deadzone(int16_t v, float dz) {
-    float norm = static_cast<float>(v) / 32767.0f;
-    float av = std::fabs(norm);
-    if (av <= dz) return 0;
-    float scaled = (av - dz) / std::max(0.01f, 1.0f - dz);
-    if (scaled > 1.0f) scaled = 1.0f;
-    int32_t r = static_cast<int32_t>(std::copysign(scaled, norm) * 32767.0f);
-    return static_cast<int16_t>(std::clamp(r, -32767, 32767));
+void apply_radial_deadzone_2d(int16_t rx_in, int16_t ry_in, float inner_dz, float sensitivity,
+                              bool invert_y, int16_t& out_x, int16_t& out_y) {
+    hle_input_apply_deadzone_2d(rx_in, ry_in, inner_dz, sensitivity, invert_y, &out_x, &out_y);
+}
+
+int detect_sdl_pad_family(SDL_GameController* gc) {
+    if (!gc) return 0;
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+    switch (SDL_GameControllerGetType(gc)) {
+        case SDL_CONTROLLER_TYPE_PS3:
+        case SDL_CONTROLLER_TYPE_PS4:
+        case SDL_CONTROLLER_TYPE_PS5:
+            return 1;
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+            return 2;
+        default:
+            break;
+    }
+#endif
+    return 0;
 }
 
 void ensure_sdl_controllers_scanned() {
@@ -72,6 +87,10 @@ void ensure_sdl_controllers_scanned() {
         }
         SDL_GameControllerEventState(SDL_ENABLE);
         SDL_GameControllerAddMappingsFromFile("gamecontrollerdb.txt");
+        if (const char* bp = SDL_GetBasePath()) {
+            std::string db = std::string(bp) + "gamecontrollerdb.txt";
+            SDL_GameControllerAddMappingsFromFile(db.c_str());
+        }
         g_sdl_gc_inited = true;
     }
     // Attach newly discovered controllers into empty slots
@@ -171,8 +190,12 @@ void poll_host_devices(uint32_t port, bool& out_connected, uint16_t& wButtons,
 
         int16_t raw_lt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
         int16_t raw_rt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-        analog[6] = static_cast<uint8_t>(std::clamp(raw_lt * 255 / 32767, 0, 255));
-        analog[7] = static_cast<uint8_t>(std::clamp(raw_rt * 255 / 32767, 0, 255));
+        auto trig_byte = [](int16_t v) -> uint8_t {
+            if (v <= 650) return 0;
+            return static_cast<uint8_t>(std::clamp((v - 650) * 255 / (32767 - 650), 0, 255));
+        };
+        analog[6] = trig_byte(raw_lt);
+        analog[7] = trig_byte(raw_rt);
 
         int16_t r_lx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
         int16_t r_ly = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
@@ -184,10 +207,8 @@ void poll_host_devices(uint32_t port, bool& out_connected, uint16_t& wButtons,
             if (v == -32768) return 32767;
             return static_cast<int16_t>(-v);
         };
-        lx = apply_radial_deadzone(r_lx, cfg.deadzone_left);
-        ly = apply_radial_deadzone(neg_y(r_ly), cfg.deadzone_left);
-        rx = apply_radial_deadzone(r_rx, cfg.deadzone_right);
-        ry = apply_radial_deadzone(neg_y(r_ry), cfg.deadzone_right);
+        apply_radial_deadzone_2d(r_lx, neg_y(r_ly), cfg.deadzone_left, 1.0f, false, lx, ly);
+        apply_radial_deadzone_2d(r_rx, neg_y(r_ry), cfg.deadzone_right, cfg.cam_sensitivity, cfg.invert_cam_y, rx, ry);
 
         g_pads[port].lx = lx; g_pads[port].ly = ly;
         g_pads[port].rx = rx; g_pads[port].ry = ry;
@@ -200,11 +221,18 @@ void poll_host_devices(uint32_t port, bool& out_connected, uint16_t& wButtons,
         if (port == 0) {
             bool guide = btn(SDL_CONTROLLER_BUTTON_GUIDE);
             bool l3r3 = btn(SDL_CONTROLLER_BUTTON_LEFTSTICK) && btn(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
-            if ((guide && !g_prev_guide) || (l3r3 && !g_prev_l3r3)) {
+            if (!ui_is_launcher_active() && ((guide && !g_prev_guide) || (l3r3 && !g_prev_l3r3))) {
                 ui_toggle_overlay();
             }
             g_prev_guide = guide;
             g_prev_l3r3 = l3r3;
+        }
+
+        // Prevent physical controller actions from leaking into gameplay while menus/overlay are open
+        if (ui_is_launcher_active() || ui_is_overlay_open()) {
+            wButtons = 0;
+            std::memset(analog, 0, 8);
+            lx = ly = rx = ry = 0;
         }
     }
 
@@ -260,10 +288,24 @@ void poll_host_devices(uint32_t port, bool& out_connected, uint16_t& wButtons,
                 else if (ev.btn == "Y") analog[3] = 255;
                 else if (ev.btn == "START") wButtons |= 0x0010;
                 else if (ev.btn == "BACK")  wButtons |= 0x0020;
-                else if (ev.btn == "UP")    { wButtons |= 0x0001; ly = 32767; }
-                else if (ev.btn == "DOWN")  { wButtons |= 0x0002; ly = -32767; }
-                else if (ev.btn == "LEFT")  { wButtons |= 0x0004; lx = -32767; }
-                else if (ev.btn == "RIGHT") { wButtons |= 0x0008; lx = 32767; }
+                else if (ev.btn == "L3")    wButtons |= 0x0040;
+                else if (ev.btn == "R3")    wButtons |= 0x0080;
+                else if (ev.btn == "UP" || ev.btn == "D_UP")       { wButtons |= 0x0001; ly = 32767; }
+                else if (ev.btn == "DOWN" || ev.btn == "D_DOWN")   { wButtons |= 0x0002; ly = -32767; }
+                else if (ev.btn == "LEFT" || ev.btn == "D_LEFT")   { wButtons |= 0x0004; lx = -32767; }
+                else if (ev.btn == "RIGHT" || ev.btn == "D_RIGHT") { wButtons |= 0x0008; lx = 32767; }
+                else if (ev.btn == "BLACK" || ev.btn == "RB") analog[4] = 255;
+                else if (ev.btn == "WHITE" || ev.btn == "LB") analog[5] = 255;
+                else if (ev.btn == "LT") analog[6] = 255;
+                else if (ev.btn == "RT") analog[7] = 255;
+                else if (ev.btn == "LS_UP")    ly = 32767;
+                else if (ev.btn == "LS_DOWN")  ly = -32767;
+                else if (ev.btn == "LS_LEFT")  lx = -32767;
+                else if (ev.btn == "LS_RIGHT") lx = 32767;
+                else if (ev.btn == "RS_UP")    ry = 32767;
+                else if (ev.btn == "RS_DOWN")  ry = -32767;
+                else if (ev.btn == "RS_LEFT")  rx = -32767;
+                else if (ev.btn == "RS_RIGHT") rx = 32767;
                 else if (ev.btn == "RT")    analog[7] = 255;
                 else if (ev.btn == "LT")    analog[6] = 255;
             }
@@ -430,20 +472,85 @@ bool hle_input_consume_hotplug_notice(std::string& out_msg) {
     return true;
 }
 
+void hle_input_apply_deadzone_2d(int16_t rx_in, int16_t ry_in, float inner_dz, float sensitivity,
+                                 bool invert_y, int16_t* out_x, int16_t* out_y) {
+    float x = static_cast<float>(rx_in) / 32767.0f;
+    float y = static_cast<float>(ry_in) / 32767.0f;
+    if (invert_y) y = -y;
+    const float mag = std::sqrt(x * x + y * y);
+    const float dz = std::clamp(inner_dz, 0.0f, 0.85f);
+    constexpr float outer_dz = 0.04f;
+    int16_t ox = 0, oy = 0;
+    if (mag > dz && mag >= 1e-6f) {
+        const float denom = std::max(0.05f, 1.0f - outer_dz - dz);
+        float scaled = std::clamp((mag - dz) / denom, 0.0f, 1.0f);
+        float ux = (x / mag) * scaled * sensitivity;
+        float uy = (y / mag) * scaled * sensitivity;
+        const float out_mag = std::sqrt(ux * ux + uy * uy);
+        if (out_mag > 1.0f) {
+            ux /= out_mag;
+            uy /= out_mag;
+        }
+        ox = static_cast<int16_t>(std::lround(std::clamp(ux, -1.0f, 1.0f) * 32767.0f));
+        oy = static_cast<int16_t>(std::lround(std::clamp(uy, -1.0f, 1.0f) * 32767.0f));
+    }
+    if (out_x) *out_x = ox;
+    if (out_y) *out_y = oy;
+}
+
+int hle_input_get_primary_pad_type() {
+    std::lock_guard<std::mutex> lk(g_inp_mtx);
+    const AppConfig& cfg = app_config();
+    if (cfg.pad_preset == 1 || cfg.pad_preset == 2) return cfg.pad_preset;
+    for (int p = 0; p < 4; ++p) {
+        if (g_pads[p].gc) {
+            int fam = detect_sdl_pad_family(g_pads[p].gc);
+            if (fam != 0) return fam;
+            return 0;
+        }
+    }
+    return 0;
+}
+
+bool hle_input_get_port_info(int port, bool* out_connected, char* out_name, size_t max_name) {
+    std::lock_guard<std::mutex> lk(g_inp_mtx);
+    if (port < 0 || port >= 4) return false;
+    bool conn = (g_pads[port].gc != nullptr);
+    if (out_connected) *out_connected = conn;
+    if (out_name && max_name > 0) {
+        if (conn && !g_pads[port].name.empty()) {
+            std::snprintf(out_name, max_name, "%s", g_pads[port].name.c_str());
+        } else {
+            out_name[0] = '\0';
+        }
+    }
+    return true;
+}
+
 void hle_input_set_script(const std::string& spec) {
     g_auto_inputs.clear();
     size_t pos = 0;
     while (pos < spec.size()) {
         size_t comma = spec.find(',', pos);
         std::string tok = (comma == std::string::npos) ? spec.substr(pos) : spec.substr(pos, comma - pos);
-        size_t dash = tok.find('-');
         size_t colon = tok.find(':');
-        if (dash != std::string::npos && colon != std::string::npos && dash < colon) {
+        if (colon != std::string::npos) {
+            std::string range = tok.substr(0, colon);
+            std::string tail  = tok.substr(colon + 1);
+            size_t dash  = range.find('-');
+            size_t colon2 = tail.find(':');
             AutoInputEvt e{};
-            e.f_start = std::strtoull(tok.substr(0, dash).c_str(), nullptr, 10);
-            e.f_end   = std::strtoull(tok.substr(dash + 1, colon - dash - 1).c_str(), nullptr, 10);
-            e.btn     = tok.substr(colon + 1);
-            g_auto_inputs.push_back(std::move(e));
+            if (dash != std::string::npos) {
+                e.f_start = std::strtoull(range.substr(0, dash).c_str(), nullptr, 10);
+                e.f_end   = std::strtoull(range.substr(dash + 1).c_str(), nullptr, 10);
+                e.btn     = tail;
+                g_auto_inputs.push_back(std::move(e));
+            } else if (colon2 != std::string::npos) {
+                e.f_start = std::strtoull(range.c_str(), nullptr, 10);
+                e.f_end   = e.f_start + std::strtoull(tail.substr(colon2 + 1).c_str(), nullptr, 10);
+                e.btn     = tail.substr(0, colon2);
+                g_auto_inputs.push_back(std::move(e));
+            }
         }
         if (comma == std::string::npos) break;
         pos = comma + 1;

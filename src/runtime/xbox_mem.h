@@ -44,14 +44,17 @@ void xbox_mem_shutdown();
 bool xbox_load_xbe_from_memory(const uint8_t* xbe_bytes, size_t size);
 void xbox_mem_protect_readonly();
 
-// Thread TEB/KPCR creation in guest space
+// Thread TEB/KPCR creation & cleanup in guest space
 uint32_t xbox_alloc_teb(uint32_t stack_base_va, uint32_t stack_limit_va, uint32_t tls_size, uint32_t thread_id);
+void     xbox_free_teb(uint32_t kpcr_va);
 
-// Guest allocators (thread-safe)
+// Guest allocators (thread-safe, sorted coalescing)
 uint32_t xbox_guest_alloc(uint32_t size, uint32_t align = 4096u, bool zero_init = true);
 bool     xbox_guest_free(uint32_t va);
 uint32_t xbox_guest_alloc_size(uint32_t va);
 void     xbox_guest_query_stats(uint32_t* total_pages, uint32_t* avail_pages);
+uint64_t xbox_mem_used_bytes();
+size_t   xbox_mem_free_block_count();
 
 // Read/write guest C strings cleanly
 std::string xbox_read_cstr(uint32_t va, size_t max_len = 512);

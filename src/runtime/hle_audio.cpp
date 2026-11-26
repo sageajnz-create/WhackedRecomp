@@ -60,12 +60,17 @@ struct DSBufferState {
     uint32_t guest_va = 0;
     int ref_count = 1;
     AudioFormat fmt{};
+    uint32_t ring_bytes = 0;
+    uint32_t ring_va = 0;
+    bool ring_dirty = false;
     std::vector<uint8_t> raw_data;
     std::vector<int16_t> pcm_data;
     double cursor_frames = 0.0;
     int32_t volume_mb = 0;
     uint32_t headroom = 0;
     uint32_t freq_hz = 44100;
+    float pan_l = 1.0f;
+    float pan_r = 1.0f;
     bool looping = false;
     bool paused = false;
     bool active_started = false;
@@ -79,6 +84,8 @@ struct DSStreamState {
     uint32_t cb_fn_va = 0;
     uint32_t cb_ctx_va = 0;
     int32_t volume_mb = 0;
+    float pan_l = 1.0f;
+    float pan_r = 1.0f;
     bool paused = false;
     std::vector<std::unique_ptr<PendingPacket>> pending;
 };
@@ -131,7 +138,8 @@ float mb_to_linear(int32_t mb) {
     return std::clamp(std::pow(10.0f, static_cast<float>(mb) / 2000.0f), 0.0f, 1.0f);
 }
 
-inline void sample_pcm_linear(const int16_t* pcm, size_t total_frames, uint16_t ch, double pos, float gain, float& outL, float& outR) {
+inline void sample_pcm_linear(const int16_t* pcm, size_t total_frames, uint16_t ch, double pos,
+                              float gainL, float gainR, float& outL, float& outR) {
     size_t i0 = static_cast<size_t>(pos);
     if (i0 >= total_frames) return;
     size_t i1 = (i0 + 1 < total_frames) ? (i0 + 1) : i0;
@@ -140,15 +148,46 @@ inline void sample_pcm_linear(const int16_t* pcm, size_t total_frames, uint16_t 
     if (ch == 1) {
         float s0 = pcm[i0] * inv;
         float s1 = pcm[i1] * inv;
-        float s = (s0 + (s1 - s0) * t) * gain;
-        outL += s;
-        outR += s;
+        float s = s0 + (s1 - s0) * t;
+        outL += s * gainL;
+        outR += s * gainR;
     } else {
         float l0 = pcm[i0 * 2 + 0] * inv, r0 = pcm[i0 * 2 + 1] * inv;
         float l1 = pcm[i1 * 2 + 0] * inv, r1 = pcm[i1 * 2 + 1] * inv;
-        outL += (l0 + (l1 - l0) * t) * gain;
-        outR += (r0 + (r1 - r0) * t) * gain;
+        outL += (l0 + (l1 - l0) * t) * gainL;
+        outR += (r0 + (r1 - r0) * t) * gainR;
     }
+}
+
+void compute_mixbin_pan(uint32_t pMixBins, float& out_l, float& out_r) {
+    if (!pMixBins || !mem_ptr(pMixBins)) return;
+    uint32_t count = std::min<uint32_t>(rd32(pMixBins), 16u);
+    uint32_t pairs_va = rd32(pMixBins + 4u);
+    if (!count || !pairs_va || !mem_ptr(pairs_va)) return;
+    float gl = 0.0f, gr = 0.0f;
+    bool has_lr = false;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t bin = rd32(pairs_va + i * 8u + 0u);
+        int32_t  vol = static_cast<int32_t>(rd32(pairs_va + i * 8u + 4u));
+        float g = mb_to_linear(vol);
+        // Xbox MixBins: 0=FrontL, 1=FrontR, 2=FrontC, 3=LFE, 4=BackL, 5=BackR
+        if (bin == 0 || bin == 4) { gl = std::max(gl, g); has_lr = true; }
+        else if (bin == 1 || bin == 5) { gr = std::max(gr, g); has_lr = true; }
+        else if (bin == 2) { gl = std::max(gl, g * 0.707f); gr = std::max(gr, g * 0.707f); has_lr = true; }
+    }
+    if (has_lr) {
+        out_l = std::clamp(gl, 0.0f, 1.0f);
+        out_r = std::clamp(gr, 0.0f, 1.0f);
+    }
+}
+
+void decode_to_pcm16(const AudioFormat& fmt, const uint8_t* src, size_t len, std::vector<int16_t>& out);
+
+inline float soft_limit_sample(float x) {
+    float ax = std::fabs(x);
+    if (ax <= 0.85f) return x;
+    float shaped = 0.85f + 0.15f * std::tanh((ax - 0.85f) / 0.15f);
+    return std::copysign(std::min(1.0f, shaped), x);
 }
 
 void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
@@ -164,17 +203,24 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
     {
         std::lock_guard<std::mutex> lk(g_audio_mtx);
 
-        // 1. Mix DirectSound Buffers (SFX / UI sounds)
+        // 1. Mix DirectSound Buffers (SFX / UI / Lock-ring buffers)
         for (auto& kv : g_buffers) {
             DSBufferState* b = kv.second.get();
-            if (!b->active_started || b->paused || b->pcm_data.empty()) continue;
+            if (!b->active_started || b->paused) continue;
+            if (b->ring_dirty && b->ring_va && b->ring_bytes > 0 && mem_ptr(b->ring_va)) {
+                decode_to_pcm16(b->fmt, mem_ptr(b->ring_va), b->ring_bytes, b->pcm_data);
+                b->ring_dirty = false;
+            }
+            if (b->pcm_data.empty()) continue;
             uint16_t ch = std::max<uint16_t>(1, b->fmt.channels);
             size_t total_frames = b->pcm_data.size() / ch;
             if (total_frames == 0) continue;
 
             uint32_t hz = b->freq_hz ? b->freq_hz : (b->fmt.sample_rate ? b->fmt.sample_rate : MIXER_RATE);
             double step = static_cast<double>(hz) / static_cast<double>(MIXER_RATE);
-            float gain = mb_to_linear(b->volume_mb - static_cast<int32_t>(b->headroom)) * sfx_mul;
+            float base_gain = mb_to_linear(b->volume_mb - static_cast<int32_t>(b->headroom)) * sfx_mul;
+            float gL = base_gain * b->pan_l;
+            float gR = base_gain * b->pan_r;
 
             for (size_t i = 0; i < out_frames; ++i) {
                 if (b->cursor_frames >= static_cast<double>(total_frames)) {
@@ -186,9 +232,9 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
                         break;
                     }
                 }
-                if (gain > 0.0001f) {
+                if (gL > 0.0001f || gR > 0.0001f) {
                     sample_pcm_linear(b->pcm_data.data(), total_frames, ch, b->cursor_frames,
-                                      gain, g_mix_buf[i * 2 + 0], g_mix_buf[i * 2 + 1]);
+                                      gL, gR, g_mix_buf[i * 2 + 0], g_mix_buf[i * 2 + 1]);
                 }
                 b->cursor_frames += step;
             }
@@ -200,7 +246,9 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
             if (st->paused || st->pending.empty()) continue;
             uint16_t ch = std::max<uint16_t>(1, st->fmt.channels);
             double step = static_cast<double>(st->fmt.sample_rate ? st->fmt.sample_rate : MIXER_RATE) / static_cast<double>(MIXER_RATE);
-            float gain = mb_to_linear(st->volume_mb) * mus_mul;
+            float base_gain = mb_to_linear(st->volume_mb) * mus_mul;
+            float gL = base_gain * st->pan_l;
+            float gR = base_gain * st->pan_r;
 
             size_t out_i = 0;
             while (out_i < out_frames && !st->pending.empty()) {
@@ -212,9 +260,9 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
                     continue;
                 }
                 while (out_i < out_frames && pkt->cursor_frames < static_cast<double>(pkt_frames)) {
-                    if (gain > 0.0001f) {
+                    if (gL > 0.0001f || gR > 0.0001f) {
                         sample_pcm_linear(pkt->pcm.data(), pkt_frames, ch, pkt->cursor_frames,
-                                          gain, g_mix_buf[out_i * 2 + 0], g_mix_buf[out_i * 2 + 1]);
+                                          gL, gR, g_mix_buf[out_i * 2 + 0], g_mix_buf[out_i * 2 + 1]);
                     }
                     pkt->cursor_frames += step;
                     ++out_i;
@@ -245,7 +293,7 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
                 while (out_i < out_frames && chunk.cursor_frames < static_cast<double>(cf)) {
                     if (gain > 0.0001f) {
                         sample_pcm_linear(chunk.pcm.data(), cf, ch, chunk.cursor_frames,
-                                          gain, g_mix_buf[out_i * 2 + 0], g_mix_buf[out_i * 2 + 1]);
+                                          gain, gain, g_mix_buf[out_i * 2 + 0], g_mix_buf[out_i * 2 + 1]);
                     }
                     chunk.cursor_frames += step;
                     ++out_i;
@@ -266,8 +314,7 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
 
     if (out_stereo) {
         for (size_t i = 0; i < out_frames * 2; ++i) {
-            float v = std::clamp(g_mix_buf[i], -1.0f, 1.0f);
-            out_stereo[i] = static_cast<int16_t>(v * 32767.0f);
+            out_stereo[i] = static_cast<int16_t>(soft_limit_sample(g_mix_buf[i]) * 32767.0f);
         }
     }
 }
@@ -418,7 +465,10 @@ FileXmoState*  find_fxmo(uint32_t va)   { auto it = g_fxmos.find(va);   return i
 uint32_t ds_buffer_create_impl(uint32_t desc_va) {
     ensure_audio_mixer();
     auto buf = std::make_unique<DSBufferState>();
-    if (desc_va && mem_ptr(desc_va)) buf->fmt = read_wfx(rd32(desc_va + 0x0C));
+    if (desc_va && mem_ptr(desc_va)) {
+        buf->ring_bytes = rd32(desc_va + 0x08);
+        buf->fmt = read_wfx(rd32(desc_va + 0x0C));
+    }
     buf->freq_hz = buf->fmt.sample_rate ? buf->fmt.sample_rate : MIXER_RATE;
     uint32_t va = xbox_guest_alloc(16, 16, true);
     if (!va) return 0;
@@ -584,8 +634,77 @@ void ds_Buffer_SetFrequency(CpuContext& ctx) {
     hle_ret_u32(ctx, XB_DS_OK, 8);
 }
 
-void ds_Buffer_SetMixBinVolumes(CpuContext& ctx) { hle_ret_u32(ctx, XB_DS_OK, 8); }
-void ds_Buffer_SetMixBins(CpuContext& ctx)       { hle_ret_u32(ctx, XB_DS_OK, 8); }
+void ds_Buffer_GetCurrentPosition(CpuContext& ctx) {
+    // (pBuf, pdwCurrentPlayCursor, pdwCurrentWriteCursor) -> ret 12
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    DSBufferState* buf = find_buffer(hle_arg(ctx, 0));
+    uint32_t pdwPlay = hle_arg(ctx, 1);
+    uint32_t pdwWrite = hle_arg(ctx, 2);
+    uint32_t play_b = 0, write_b = 0;
+    if (buf) {
+        uint32_t frame_bytes = std::max<uint32_t>(2u, buf->fmt.channels * 2u);
+        uint32_t total_b = buf->ring_bytes ? buf->ring_bytes :
+                           static_cast<uint32_t>(std::max<size_t>(frame_bytes, buf->pcm_data.size() * 2u));
+        play_b = static_cast<uint32_t>(buf->cursor_frames * frame_bytes) % std::max(1u, total_b);
+        write_b = (play_b + frame_bytes * 512u) % std::max(1u, total_b);
+    }
+    if (pdwPlay && mem_ptr(pdwPlay)) wr32(pdwPlay, play_b);
+    if (pdwWrite && mem_ptr(pdwWrite)) wr32(pdwWrite, write_b);
+    hle_ret_u32(ctx, XB_DS_OK, 12);
+}
+
+void ds_Buffer_Lock(CpuContext& ctx) {
+    // (pBuf, dwOffset, dwBytes, ppvAudioPtr1, pdwAudioBytes1, ppvAudioPtr2, pdwAudioBytes2, dwFlags) -> ret 32
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    DSBufferState* buf = find_buffer(hle_arg(ctx, 0));
+    uint32_t off = hle_arg(ctx, 1);
+    uint32_t req = hle_arg(ctx, 2);
+    uint32_t ppv1 = hle_arg(ctx, 3);
+    uint32_t pdw1 = hle_arg(ctx, 4);
+    uint32_t ppv2 = hle_arg(ctx, 5);
+    uint32_t pdw2 = hle_arg(ctx, 6);
+    uint32_t flags = hle_arg(ctx, 7);
+    if (!buf) { hle_ret_u32(ctx, XB_E_INVALIDARG, 32); return; }
+
+    uint32_t total = buf->ring_bytes ? buf->ring_bytes : std::max<uint32_t>(4096u, off + req);
+    if (flags & 2u) { off = 0; req = total; } // DSBLOCK_ENTIREBUFFER
+    if (!buf->ring_va) {
+        buf->ring_bytes = total;
+        buf->ring_va = xbox_guest_alloc(std::max<uint32_t>(64u, total), 32u, true);
+    }
+    if (!buf->ring_va || total == 0) { hle_ret_u32(ctx, XB_E_OUTOFMEMORY, 32); return; }
+    off %= total;
+    req = std::min(req, total);
+    uint32_t b1 = std::min(req, total - off);
+    uint32_t b2 = req - b1;
+    if (ppv1 && mem_ptr(ppv1)) wr32(ppv1, buf->ring_va + off);
+    if (pdw1 && mem_ptr(pdw1)) wr32(pdw1, b1);
+    if (ppv2 && mem_ptr(ppv2)) wr32(ppv2, b2 ? buf->ring_va : 0u);
+    if (pdw2 && mem_ptr(pdw2)) wr32(pdw2, b2);
+    buf->ring_dirty = true;
+    hle_ret_u32(ctx, XB_DS_OK, 32);
+}
+
+void ds_Buffer_Unlock(CpuContext& ctx) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    if (DSBufferState* buf = find_buffer(hle_arg(ctx, 0))) buf->ring_dirty = true;
+    hle_ret_u32(ctx, XB_DS_OK, 12);
+}
+
+void ds_Buffer_SetMixBinVolumes(CpuContext& ctx) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    if (DSBufferState* buf = find_buffer(hle_arg(ctx, 0))) {
+        compute_mixbin_pan(hle_arg(ctx, 1), buf->pan_l, buf->pan_r);
+    }
+    hle_ret_u32(ctx, XB_DS_OK, 8);
+}
+void ds_Buffer_SetMixBins(CpuContext& ctx) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    if (DSBufferState* buf = find_buffer(hle_arg(ctx, 0))) {
+        compute_mixbin_pan(hle_arg(ctx, 1), buf->pan_l, buf->pan_r);
+    }
+    hle_ret_u32(ctx, XB_DS_OK, 8);
+}
 void ds_Buffer_SetMode(CpuContext& ctx)          { hle_ret_u32(ctx, XB_DS_OK, 12); }
 void ds_Buffer_SetMode_8(CpuContext& ctx)        { hle_ret_u32(ctx, XB_DS_OK, 8); }
 
@@ -594,7 +713,13 @@ void ds_Stream_SetVolume(CpuContext& ctx) {
     if (DSStreamState* st = find_stream(hle_arg(ctx, 0))) st->volume_mb = static_cast<int32_t>(hle_arg(ctx, 1));
     hle_ret_u32(ctx, XB_DS_OK, 8);
 }
-void ds_Stream_SetMixBinVolumes(CpuContext& ctx) { hle_ret_u32(ctx, XB_DS_OK, 8); }
+void ds_Stream_SetMixBinVolumes(CpuContext& ctx) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    if (DSStreamState* st = find_stream(hle_arg(ctx, 0))) {
+        compute_mixbin_pan(hle_arg(ctx, 1), st->pan_l, st->pan_r);
+    }
+    hle_ret_u32(ctx, XB_DS_OK, 8);
+}
 void ds_Stream_Pause(CpuContext& ctx) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
     if (DSStreamState* st = find_stream(hle_arg(ctx, 0))) st->paused = (hle_arg(ctx, 1) != 0);
@@ -719,7 +844,13 @@ void ds_Object_Release(CpuContext& ctx) {
     }
     if (auto it = g_buffers.find(obj); it != g_buffers.end()) {
         int r = --it->second->ref_count;
-        if (r <= 0) { g_buffers.erase(it); xbox_guest_free(obj); hle_ret_u32(ctx, 0u, 4); return; }
+        if (r <= 0) {
+            if (it->second->ring_va) xbox_guest_free(it->second->ring_va);
+            g_buffers.erase(it);
+            xbox_guest_free(obj);
+            hle_ret_u32(ctx, 0u, 4);
+            return;
+        }
         hle_ret_u32(ctx, static_cast<uint32_t>(r), 4); return;
     }
     if (auto it = g_streams.find(obj); it != g_streams.end()) {
@@ -835,8 +966,8 @@ void populate_vtables() {
     }, FN_DS_BASE);
     write_vtbl(VTBL_DSB_VA, {
         {0x00, ds_Object_AddRef}, {0x04, ds_Object_Release}, {0x08, ds_Buffer_SetBufferData},
-        {0x0C, ds_InternalStub_12}, {0x10, ds_InternalStub_12}, {0x14, ds_Buffer_GetStatus},
-        {0x18, ds_InternalStub_12}, {0x1C, ds_Buffer_SetCurrentPosition}, {0x20, ds_Buffer_Play},
+        {0x0C, ds_InternalStub_12}, {0x10, ds_Buffer_GetCurrentPosition}, {0x14, ds_Buffer_GetStatus},
+        {0x18, ds_Buffer_Lock}, {0x1C, ds_Buffer_SetCurrentPosition}, {0x20, ds_Buffer_Play},
         {0x24, ds_InternalStub_16}, {0x28, ds_Buffer_Stop}, {0x2C, ds_InternalStub_16},
         {0x30, ds_Buffer_SetVolume}, {0x34, ds_Buffer_SetFrequency}, {0x38, ds_Buffer_SetMixBins},
         {0x3C, ds_Buffer_SetMixBinVolumes}, {0x40, ds_Buffer_SetHeadroom}, {0x44, ds_Buffer_SetMode},
@@ -930,7 +1061,10 @@ void hle_register_audio() {
     recomp_register_fn(0x0026310Eu, ds_Buffer_Play);
     recomp_register_fn(0x00263156u, ds_Buffer_Stop);
     recomp_register_fn(0x002631F2u, ds_Buffer_GetStatus);
+    recomp_register_fn(0x0026320Eu, ds_Buffer_GetCurrentPosition);
     recomp_register_fn(0x0026322Eu, ds_Buffer_SetCurrentPosition);
+    recomp_register_fn(0x0026324Au, ds_Buffer_Lock);
+    recomp_register_fn(0x0026327Au, ds_Buffer_Unlock);
     recomp_register_fn(0x0026329Au, ds_Buffer_SetVolume);
     recomp_register_fn(0x002632B3u, ds_Buffer_SetHeadroom);
     recomp_register_fn(0x002632B8u, ds_Buffer_SetMixBinVolumes);
@@ -949,4 +1083,21 @@ void hle_register_audio() {
     recomp_register_fn(0x0028C0D6u, wma_dBToLinear);
 
     std::printf("[HLE] Registered 24 DSOUND + 2 WMADEC + SDL2 Stereo Audio Mixer hooks.\n");
+}
+
+float hle_audio_soft_limit(float x) {
+    return soft_limit_sample(x);
+}
+
+size_t hle_audio_decode_xbox_adpcm(const uint8_t* src, size_t src_bytes, int channels,
+                                   std::vector<int16_t>& out_pcm) {
+    out_pcm.clear();
+    if (!src || src_bytes == 0 || (channels != 1 && channels != 2)) return 0;
+    AudioFormat fmt{};
+    fmt.format_tag = 0x0069u;
+    fmt.channels = static_cast<uint16_t>(channels);
+    fmt.sample_rate = 44100u;
+    fmt.bits_per_sample = 4u;
+    decode_to_pcm16(fmt, src, src_bytes, out_pcm);
+    return out_pcm.size();
 }
