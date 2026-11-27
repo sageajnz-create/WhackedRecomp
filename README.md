@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Whacked! Recompiled" width="520" />
 </p>
 
-<h3 align="center">Whacked! (Original Xbox, 2002) Static x86-to-x64 Recompilation for Windows &amp; Linux</h3>
+<h3 align="center">Whacked! (Original Xbox, 2002) Static x86-to-x64 Recompilation for Windows and Linux</h3>
 
 <p align="center">
   <a href="https://github.com/sageajnz-create/WhackedRecomp/actions/workflows/ci.yml"><img src="https://github.com/sageajnz-create/WhackedRecomp/actions/workflows/ci.yml/badge.svg" alt="CI Build" /></a>
