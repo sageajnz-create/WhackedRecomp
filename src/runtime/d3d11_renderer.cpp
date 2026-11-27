@@ -6,6 +6,7 @@
 #include <dxgi.h>
 #include <d3dcompiler.h>
 #include "d3d11_renderer.h"
+#include "hle_common.h"
 #include "tex_decode.h"
 #include "launcher_ui.h"
 #include <SDL.h>
@@ -24,6 +25,7 @@
 namespace {
 
 HWND g_hwnd = nullptr;
+SDL_Window* g_sdl_win = nullptr;
 RendererSettings g_cfg{};
 std::atomic<int> g_pending_resize_w{0}, g_pending_resize_h{0};
 std::thread::id g_dx_owner_tid{};
@@ -36,6 +38,8 @@ ID3D11RenderTargetView* g_back_rtv = nullptr;
 ID3D11Texture2D*        g_msaa_color = nullptr;
 ID3D11RenderTargetView* g_msaa_rtv = nullptr;
 ID3D11Texture2D*        g_resolve_tex = nullptr;
+UINT g_scene_samples = 1;
+bool g_has_resolved_frame = false;
 ID3D11ShaderResourceView* g_resolve_srv = nullptr;
 ID3D11Texture2D*        g_depth_tex = nullptr;
 ID3D11DepthStencilView* g_depth_dsv = nullptr;
@@ -143,6 +147,7 @@ void release_targets() {
 
 bool create_targets(int w, int h) {
     release_targets();
+    g_has_resolved_frame = false;
     g_cfg.width = std::max(64, w);
     g_cfg.height = std::max(64, h);
 
@@ -158,6 +163,7 @@ bool create_targets(int w, int h) {
             sample_cnt = 4;
         }
     }
+    g_scene_samples = sample_cnt;
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = static_cast<UINT>(g_cfg.width);
@@ -551,9 +557,10 @@ void save_backbuffer_png(const std::string& path) {
 } // namespace
 
 bool d3d11_init(void* sdl_win, const RendererSettings& settings) {
+    g_sdl_win = static_cast<SDL_Window*>(sdl_win);
     SDL_SysWMinfo wmi{};
     SDL_VERSION(&wmi.version);
-    if (!SDL_GetWindowWMInfo(static_cast<SDL_Window*>(sdl_win), &wmi)) {
+    if (!SDL_GetWindowWMInfo(g_sdl_win, &wmi)) {
         std::fprintf(stderr, "[GFX] SDL_GetWindowWMInfo failed: %s\n", SDL_GetError());
         return false;
     }
@@ -565,13 +572,11 @@ bool d3d11_init(void* sdl_win, const RendererSettings& settings) {
     sd.BufferDesc.Width = static_cast<UINT>(g_cfg.width);
     sd.BufferDesc.Height = static_cast<UINT>(g_cfg.height);
     sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = g_hwnd;
     sd.SampleDesc.Count = 1;
     sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     D3D_FEATURE_LEVEL fls[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
     D3D_FEATURE_LEVEL fl_out = D3D_FEATURE_LEVEL_11_0;
@@ -579,10 +584,39 @@ bool d3d11_init(void* sdl_win, const RendererSettings& settings) {
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
                                                fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl_out, &g_ctx);
     if (FAILED(hr)) {
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                                           fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl_out, &g_ctx);
+    }
+    const bool use_warp = FAILED(hr);
+    if (use_warp) {
+        hle_log_note("[GFX] D3D11 hardware initialization failed (0x%08lX), trying WARP", static_cast<unsigned long>(hr));
         hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
                                            fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl_out, &g_ctx);
         if (FAILED(hr)) return false;
         std::printf("[GFX] D3D11 WARP fallback active.\n");
+    }
+    DXGI_ADAPTER_DESC adapter_desc{};
+    IDXGIDevice* dxgi_device = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    IDXGIFactory* factory = nullptr;
+    if (SUCCEEDED(g_sc->GetParent(IID_PPV_ARGS(&factory)))) {
+        factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);
+        factory->Release();
+    }
+    SDL_DisplayMode mode{};
+    SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(g_sdl_win), &mode);
+    hle_log_note("[GFX] D3D11 driver: %s, %s, display %d Hz", use_warp ? "WARP (software)" : "hardware",
+                 sd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ? "flip discard" : "legacy discard",
+                 mode.refresh_rate);
+    if (SUCCEEDED(g_dev->QueryInterface(IID_PPV_ARGS(&dxgi_device)))) {
+        if (SUCCEEDED(dxgi_device->GetAdapter(&adapter))) {
+            if (SUCCEEDED(adapter->GetDesc(&adapter_desc))) {
+                hle_log_note("[GFX] D3D11 adapter: %ls", adapter_desc.Description);
+            }
+            adapter->Release();
+        }
+        dxgi_device->Release();
     }
 
     if (!create_targets(g_cfg.width, g_cfg.height)) return false;
@@ -675,7 +709,7 @@ void d3d11_resize(int width, int height) {
 }
 
 void d3d11_set_fullscreen(bool fs) {
-    if (g_sc) g_sc->SetFullscreenState(fs ? TRUE : FALSE, nullptr);
+    if (g_sdl_win) SDL_SetWindowFullscreen(g_sdl_win, fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 }
 
 ID3D11Device* d3d11_device() { return g_dev; }
@@ -803,8 +837,9 @@ void d3d11_draw(const DrawStateSnapshot& st) {
 
     float rt_w = (st.custom_rt) ? static_cast<float>(st.custom_rt->width)  : static_cast<float>(g_cfg.width);
     float rt_h = (st.custom_rt) ? static_cast<float>(st.custom_rt->height) : static_cast<float>(g_cfg.height);
-    float sx = rt_w / std::max(1.0f, st.xb_fb_w);
-    float sy = rt_h / std::max(1.0f, st.xb_fb_h);
+    // Render-to-texture viewports are already in the guest texture's pixels.
+    float sx = st.custom_rt ? 1.0f : rt_w / std::max(1.0f, st.xb_fb_w);
+    float sy = st.custom_rt ? 1.0f : rt_h / std::max(1.0f, st.xb_fb_h);
     D3D11_VIEWPORT vp{st.vp_x * sx, st.vp_y * sy, st.vp_w * sx, st.vp_h * sy, st.vp_minz, st.vp_maxz};
     if (vp.Width < 1) vp.Width = rt_w;
     if (vp.Height < 1) vp.Height = rt_h;
@@ -955,7 +990,7 @@ void d3d11_draw(const DrawStateSnapshot& st) {
             if (!entry.buf || entry.bytes < st.vb_total_bytes[s]) {
                 if (entry.buf) entry.buf->Release();
                 D3D11_BUFFER_DESC bd{};
-                bd.ByteWidth = (st.vb_total_bytes[s] + 15u) & ~15u;
+                bd.ByteWidth = st.vb_total_bytes[s];
                 bd.Usage = D3D11_USAGE_DEFAULT;
                 bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
                 g_dev->CreateBuffer(&bd, nullptr, &entry.buf);
@@ -1106,16 +1141,23 @@ void d3d11_present() {
         g_fps_t0 = now;
     }
 
-    if (ui_is_launcher_active()) {
-        float bg[4] = {0.05f, 0.06f, 0.09f, 1.0f};
-        g_ctx->OMSetRenderTargets(1, &g_back_rtv, nullptr);
-        g_ctx->ClearRenderTargetView(g_back_rtv, bg);
-    } else if (g_msaa_color && g_resolve_tex && (g_draw_calls > 0 || g_clear_calls > 0)) {
-        if (g_cfg.msaa_4x) {
+    bool launcher_active = ui_is_launcher_active();
+    if (!launcher_active && g_msaa_color && g_resolve_tex && (g_draw_calls > 0 || g_clear_calls > 0)) {
+        // The previous frame sampled the resolve texture. Unbind it before writing.
+        ID3D11ShaderResourceView* null_srv = nullptr;
+        g_ctx->PSSetShaderResources(0, 1, &null_srv);
+        if (g_scene_samples > 1) {
             g_ctx->ResolveSubresource(g_resolve_tex, 0, g_msaa_color, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
         } else {
             g_ctx->CopyResource(g_resolve_tex, g_msaa_color);
         }
+        g_has_resolved_frame = true;
+    }
+    if (launcher_active || !g_has_resolved_frame) {
+        float bg[4] = {0.05f, 0.06f, 0.09f, 1.0f};
+        g_ctx->OMSetRenderTargets(1, &g_back_rtv, nullptr);
+        g_ctx->ClearRenderTargetView(g_back_rtv, bg);
+    } else {
         QuadVert fsq[6] = {
             {-1,  1, 0, 0, 0xFFFFFFFFu}, { 1,  1, 1, 0, 0xFFFFFFFFu}, {-1, -1, 0, 1, 0xFFFFFFFFu},
             { 1,  1, 1, 0, 0xFFFFFFFFu}, { 1, -1, 1, 1, 0xFFFFFFFFu}, {-1, -1, 0, 1, 0xFFFFFFFFu}

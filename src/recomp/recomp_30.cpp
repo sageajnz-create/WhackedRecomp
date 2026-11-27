@@ -36173,7 +36173,7 @@ L_001ed730:;
 
 void fn_001ee841(CpuContext& ctx) {
     ctx.last_pc = 0x001ee841u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     recomp_dispatch_call(ctx, 0x001ee843u); return;
 }
 

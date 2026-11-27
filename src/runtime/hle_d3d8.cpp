@@ -106,7 +106,12 @@ struct GuestTexture {
     uint32_t levels = 1;
     std::vector<uint32_t> level_surf_vas; // [face*levels + mip]
     bool     locked_ever = false;
-    uint64_t last_upload_frame = 0;
+    uint64_t last_check_frame = 0;
+    uint64_t next_check_frame = 0;
+    uint32_t unchanged_checks = 0;
+    uint32_t last_checked_pal_va = 0;
+    uint32_t data_bytes = 0;
+    std::vector<uint8_t> last_checked_data;
 };
 
 struct GuestBuffer {
@@ -143,6 +148,7 @@ struct GuestPS {
     uint32_t handle = 0;
     uint32_t psdef[60]{};
     const Nv2aCompiledPS* compiled = nullptr;
+    bool compiled_done = false;
 };
 
 std::mutex g_d3d_mtx;
@@ -612,9 +618,43 @@ void sync_and_draw(uint32_t prim_type, uint32_t vertex_count, uint32_t index_cou
         if (tva) {
             auto it = g_textures.find(tva);
             if (it != g_textures.end() && it->second.gpu) {
-                if (it->second.locked_ever && !it->second.gpu->is_render_target && it->second.last_upload_frame != frame_id) {
-                    it->second.gpu->dirty = true;
-                    it->second.last_upload_frame = frame_id;
+                auto& texture = it->second;
+                auto* gpu = texture.gpu;
+                if (texture.locked_ever && !gpu->is_render_target && texture.last_check_frame != frame_id) {
+                    if (gpu->xb_format == 0x0Bu && texture.last_checked_pal_va != st.current_palette_va) {
+                        texture.last_checked_pal_va = st.current_palette_va;
+                        texture.unchanged_checks = 0;
+                        texture.next_check_frame = 0;
+                        gpu->dirty = true;
+                    }
+                    if (frame_id >= texture.next_check_frame) {
+                        texture.last_check_frame = frame_id;
+                        // A lock can leave the game holding a writable pointer across frames.
+                        // Snapshot initial bytes, then back off checks for static textures while
+                        // explicit locks and BinkCopyToBuffer reset next_check_frame immediately.
+                        const auto* data = mem_ptr(gpu->data_va);
+                        if (!gpu->data_va || !data || !texture.data_bytes) {
+                            gpu->dirty = true;
+                            texture.unchanged_checks = 0;
+                            texture.next_check_frame = frame_id + 15ull;
+                        } else if (texture.last_checked_data.size() != texture.data_bytes ||
+                                   std::memcmp(texture.last_checked_data.data(), data, texture.data_bytes) != 0) {
+                            texture.last_checked_data.assign(data, data + texture.data_bytes);
+                            texture.unchanged_checks = 0;
+                            texture.next_check_frame = frame_id + 1ull;
+                            gpu->dirty = true;
+                        } else {
+                            ++texture.unchanged_checks;
+                            if (texture.unchanged_checks < 4u) {
+                                texture.next_check_frame = frame_id + 1ull;
+                            } else if (texture.unchanged_checks < 16u) {
+                                uint64_t stagger = (texture.unchanged_checks == 4u) ? ((texture.tex_va >> 4) % 15u) : 0ull;
+                                texture.next_check_frame = frame_id + 15ull + stagger;
+                            } else {
+                                texture.next_check_frame = frame_id + 60ull;
+                            }
+                        }
+                    }
                 }
                 st.tex[s] = it->second.gpu;
                 tex_mask |= static_cast<uint8_t>(1u << s);
@@ -636,6 +676,10 @@ void sync_and_draw(uint32_t prim_type, uint32_t vertex_count, uint32_t index_cou
     if (g_cur_ps_handle) {
         auto pit = g_pshaders.find(g_cur_ps_handle);
         if (pit != g_pshaders.end()) {
+            if (!pit->second.compiled_done) {
+                pit->second.compiled = nv2a_get_xpu_ps(pit->second.psdef);
+                pit->second.compiled_done = true;
+            }
             st.ps = pit->second.compiled;
             st.is_programmable_ps = (st.ps != nullptr);
         }
@@ -965,7 +1009,8 @@ void hle_D3D_CreateTexture2(CpuContext& ctx) {
         if (md > 1) md >>= 1;
     }
     uint32_t faces = (rtype == 5u) ? 6u : 1u;
-    uint32_t data_va = xbox_guest_alloc(std::max(64u, total_data * faces), 64u, true);
+    uint32_t data_bytes = std::max(64u, total_data * faces);
+    uint32_t data_va = xbox_guest_alloc(data_bytes, 64u, true);
     uint32_t tex_va  = xbox_guest_alloc(0x20u, 16u, true);
 
     write_surface_struct(tex_va, data_va, fmt, w, h, pitch, (rtype == 5u) ? 5u : ((rtype == 4u) ? 4u : 3u));
@@ -986,6 +1031,7 @@ void hle_D3D_CreateTexture2(CpuContext& ctx) {
     gt.tex_va = tex_va;
     gt.gpu = gpu;
     gt.levels = levels;
+    gt.data_bytes = data_bytes;
     uint32_t off = 0;
     for (uint32_t f = 0; f < faces; ++f) {
         mw = w; mh = h;
@@ -1082,7 +1128,11 @@ void hle_D3D_SurfaceLockRect(CpuContext& ctx) {
         if (s.gpu) s.gpu->dirty = true;
         if (s.parent_tex_va) {
             auto tit = g_textures.find(s.parent_tex_va);
-            if (tit != g_textures.end()) tit->second.locked_ever = true;
+            if (tit != g_textures.end()) {
+                tit->second.locked_ever = true;
+                tit->second.unchanged_checks = 0;
+                tit->second.next_check_frame = 0;
+            }
         }
         pitch = s.pitch;
         pbits = s.data_va;
@@ -1111,6 +1161,8 @@ void hle_D3D_TextureLockRect_Vol(CpuContext& ctx) {
     auto it = g_textures.find(tva);
     if (it != g_textures.end() && lvl < it->second.level_surf_vas.size()) {
         it->second.locked_ever = true;
+        it->second.unchanged_checks = 0;
+        it->second.next_check_frame = 0;
         auto sit = g_surfaces.find(it->second.level_surf_vas[lvl]);
         if (sit != g_surfaces.end() && plock) {
             const auto& s = sit->second;
@@ -1188,7 +1240,11 @@ void hle_D3D_CopyRects(CpuContext& ctx) {
         if (d.gpu) d.gpu->dirty = true;
         if (d.parent_tex_va) {
             auto tit = g_textures.find(d.parent_tex_va);
-            if (tit != g_textures.end()) tit->second.locked_ever = true;
+            if (tit != g_textures.end()) {
+                tit->second.locked_ever = true;
+                tit->second.unchanged_checks = 0;
+                tit->second.next_check_frame = 0;
+            }
         }
     }
     hle_ret_u32(ctx, 0u, 20);
@@ -1276,10 +1332,6 @@ void hle_D3D_CreateVertexShader(CpuContext& ctx) {
             gvs.microcode.resize(bytes);
             std::memcpy(gvs.microcode.data(), mem_ptr(fn_va), bytes);
             gvs.has_microcode = true;
-            // Pre-warm shader cache if possible
-            if (!gvs.decl.elements.empty()) {
-                nv2a_get_xvu_vs(gvs.decl, gvs.microcode.data(), gvs.microcode.size());
-            }
         }
         (void)magic;
     }
@@ -1345,7 +1397,6 @@ void hle_D3D_CreatePixelShader(CpuContext& ctx) {
     gps.handle = handle;
     if (pdef) {
         std::memcpy(gps.psdef, mem_ptr(pdef), 240);
-        gps.compiled = nv2a_get_xpu_ps(gps.psdef);
     }
     wr32(handle + 0, 1u);
     g_pshaders[handle] = gps;
@@ -1413,6 +1464,22 @@ void hle_D3D_VertexBufferLock(CpuContext& ctx) {
 } // namespace
 static bool g_hd720_req = false;
 void hle_d3d8_set_hd720(bool enable) { g_hd720_req = enable; }
+void hle_d3d8_mark_va_dirty(uint32_t va) {
+    if (!va) return;
+    std::lock_guard<std::mutex> lk(g_d3d_mtx);
+    for (auto& [tva, gt] : g_textures) {
+        (void)tva;
+        if (!gt.gpu || !gt.gpu->data_va || !gt.data_bytes) continue;
+        uint32_t start = gt.gpu->data_va;
+        uint32_t end = start + gt.data_bytes;
+        if (va >= start && va < end) {
+            gt.gpu->dirty = true;
+            gt.locked_ever = true;
+            gt.unchanged_checks = 0;
+            gt.next_check_frame = 0;
+        }
+    }
+}
 namespace {
 
 void hle_D3D_GetDeviceCaps(CpuContext& ctx) {
@@ -1491,6 +1558,7 @@ void hle_D3D_CreateDevice(CpuContext& ctx) {
         g_xb_widescreen_mode = (flags & 0x10u) != 0;
         std::printf("[D3D8] CreateDevice guest FB=%ux%u (Flags=0x%X, Widescreen=%d)\n",
                     g_xb_fb_w, g_xb_fb_h, flags, g_xb_widescreen_mode ? 1 : 0);
+        hle_log_note("[D3D8] Guest framebuffer: %ux%u (flags 0x%X)", g_xb_fb_w, g_xb_fb_h, flags);
     }
     ensure_guest_device_allocated();
     g_front_gpu.width = g_back_gpu.width = g_depth_gpu.width = g_xb_fb_w;

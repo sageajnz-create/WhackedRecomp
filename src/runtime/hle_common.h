@@ -47,9 +47,12 @@ uint64_t hle_file_size(uint32_t handle);
 bool hle_file_read_bink_from_handle(uint32_t handle, std::vector<uint8_t>& out_bik, uint64_t* out_off = nullptr);
 void hle_input_set_script(const std::string& spec);
 void hle_d3d8_set_hd720(bool enable);
+void hle_d3d8_mark_va_dirty(uint32_t va);
 void hle_kernel_dump_stall_state();
 void hle_kernel_signal_handle(uint32_t handle);
 void hle_kernel_notify_frame();
+struct GuestPowerOff {};
+void app_request_quit();
 uint64_t hle_kernel_get_stall_seq();
 void hle_input_set_frame(uint64_t frame_num);
 int  hle_input_get_primary_pad_type(); // 0=Xbox, 1=PlayStation, 2=Nintendo
@@ -57,6 +60,7 @@ bool hle_input_get_port_info(int port, bool* out_connected, char* out_name, size
 void hle_input_apply_deadzone_2d(int16_t rx_in, int16_t ry_in, float inner_dz, float sensitivity,
                                  bool invert_y, int16_t* out_x, int16_t* out_y);
 float hle_audio_soft_limit(float x);
+void audio_set_mix_levels(float master, float sfx, float music, bool muted);
 size_t hle_audio_decode_xbox_adpcm(const uint8_t* src, size_t src_bytes, int channels,
                                    std::vector<int16_t>& out_pcm);
 void hle_set_log_sink(void (*sink)(const char*));

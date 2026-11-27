@@ -568,6 +568,7 @@ void hle_BinkCopyToBuffer(CpuContext& ctx) {
             std::memcpy(dst + dx * 4u, src, copy_w * 4u);
         }
     }
+    hle_d3d8_mark_va_dirty(dest_va);
     hle_ret_u32(ctx, 0, 28);
 }
 

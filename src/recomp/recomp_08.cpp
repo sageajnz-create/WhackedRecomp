@@ -34807,7 +34807,7 @@ void fn_001e8680(CpuContext& ctx) {
     ctx.last_pc = 0x001e8698u;
     wrf32((ctx.eax + 0x4u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e869bu;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001e869du;
     wrf32((ctx.eax + 0x8u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e86a0u;
@@ -35934,7 +35934,7 @@ void fn_001f06c8(CpuContext& ctx) {
     goto L_001f06c8;
 L_001ee7fc:;
     ctx.last_pc = 0x001ee7fcu;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001ee7feu;
     { double _v = ctx.fpu_get(0); ctx.fpu_reg(0) = _v; ctx.fpu_pop(); }
     ctx.last_pc = 0x001ee800u;
@@ -35947,7 +35947,7 @@ L_001f06c8:;
     ctx.last_pc = 0x001f06d1u;
     if (cond_ne(ctx)) goto L_001f070e;
     ctx.last_pc = 0x001f06d3u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
 L_001f06d5:;
     ctx.last_pc = 0x001f06d5u;
     { double _x = ctx.fpu_pop(); ctx.fpu_reg(0) = ctx.fpu_get(0) * std::log2(_x); }
@@ -36002,7 +36002,7 @@ L_001f070e:;
     ctx.set_ch(static_cast<uint8_t>(~(ctx.ch())));
 L_001f0720:;
     ctx.last_pc = 0x001f0720u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001f0722u;
     ctx.fpu_reg(0) = std::fabs(ctx.fpu_reg(0));
     ctx.last_pc = 0x001f0724u;

@@ -50,6 +50,7 @@ public:
 
     std::vector<const XisoEntry*> list_iso_dir(const std::string& dir_norm_rel, const std::string& pattern) const;
     std::string host_path_for(const std::string& dev, const std::string& rel) const;
+    void set_userdata_root(const std::string& root) { userdata_root_ = root; }
 
 private:
     bool mounted_ = false;

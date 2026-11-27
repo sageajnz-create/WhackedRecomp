@@ -45,13 +45,12 @@
 namespace fs = std::filesystem;
 
 extern void audio_shutdown();
-extern void audio_set_master_volume(float vol_0_to_1);
 extern void hle_d3d8_set_hd720(bool enable);
 extern void hle_input_poll_ui_snapshot();
 
 namespace {
 
-constexpr const char* kAppVersion = "1.0.2";
+constexpr const char* kAppVersion = "1.0.3";
 
 SDL_Window* g_sdl_win = nullptr;
 std::atomic<bool> g_quit_requested{false};
@@ -103,9 +102,6 @@ bool g_fullscreen_state = false;
 void toggle_fullscreen_window() {
     g_fullscreen_state = !g_fullscreen_state;
     app_config().fullscreen = g_fullscreen_state;
-    if (g_sdl_win) {
-        SDL_SetWindowFullscreen(g_sdl_win, g_fullscreen_state ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-    }
     gfx_set_fullscreen(g_fullscreen_state);
 }
 
@@ -317,8 +313,16 @@ void pump_sdl_events() {
 
 } // namespace
 
+void app_request_quit() {
+    g_quit_requested.store(true);
+}
+
 void app_on_frame_presented(uint64_t frame_num) {
     hle_input_set_frame(frame_num);
+    if (frame_num == 120 || frame_num == 600 || frame_num == 1800) {
+        log_note("[GFX] Frame %llu: %.1f FPS, %d draws",
+                 static_cast<unsigned long long>(frame_num), gfx_get_fps(), gfx_get_last_draw_calls());
+    }
     if (g_shot_frames.count(frame_num)) {
         char buf[256];
         std::snprintf(buf, sizeof(buf), "%s/frame_%05llu.png",
@@ -572,7 +576,7 @@ int app_main(int argc, char** argv) {
 
     ui_set_userdata_root(userdata_root);
     ui_set_iso_status(iso_path, iso_ok, probe.message);
-    audio_set_master_volume(cfg.muted ? 0.0f : cfg.master_volume);
+    audio_set_mix_levels(cfg.master_volume, cfg.sfx_volume, cfg.music_volume, cfg.muted);
 
     if (cli_host_port > 0) {
         cfg.mp_mode = 1;
@@ -693,7 +697,12 @@ int app_main(int argc, char** argv) {
         ctx.push32(0xDEAD0000u);
         std::printf("[BOOT] Entering XBE Entry 0x%08X...\n", g_xbe_info.entry_va);
         log_note("[BOOT] Entering XBE Entry 0x%08X", g_xbe_info.entry_va);
-        recomp_dispatch_call(ctx, g_xbe_info.entry_va);
+        try {
+            recomp_dispatch_call(ctx, g_xbe_info.entry_va);
+        } catch (const GuestPowerOff&) {
+            app_request_quit();
+            return;
+        }
         std::printf("[BOOT] XbeEntry returned cleanly (main game thread spawned).\n");
     });
 
@@ -722,17 +731,18 @@ int app_main(int argc, char** argv) {
         g_shot_overlay_path.empty() && g_final_shot_path.empty()) {
         app_config_save(userdata_root);
     }
-    log_note("[BOOT] Clean shutdown");
+    log_note("[BOOT] Shutting down");
     if (entry_thr.joinable()) entry_thr.detach();
     hle_bink_shutdown();
     rl_ach_shutdown();
+    audio_shutdown();
     hle_kernel_shutdown();
     net_shutdown();
-    audio_shutdown();
     gfx_shutdown();
     XisoVfs::instance().unmount();
     SDL_DestroyWindow(g_sdl_win);
     SDL_Quit();
+    log_note("[BOOT] Clean shutdown");
     std::fflush(stdout);
     std::fflush(stderr);
 #ifdef _WIN32

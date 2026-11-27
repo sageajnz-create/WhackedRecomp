@@ -35717,7 +35717,7 @@ void fn_001ecdb6(CpuContext& ctx) {
     ctx.last_pc = 0x001ecdb6u;
     ctx.esp = (alu_sub<uint32_t>(ctx, ctx.esp, 0x14u, false));
     ctx.last_pc = 0x001ecdb9u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001ecdbbu;
     wrf64(ctx.esp, ctx.fpu_pop());
     ctx.last_pc = 0x001ecdbeu;

@@ -32196,7 +32196,7 @@ L_001bbdde:;
     ctx.last_pc = 0x001bbdeau;
     ctx.fpu_reg(0) = ctx.fpu_reg(0) * (static_cast<double>(rdf32(ctx.edi)));
     ctx.last_pc = 0x001bbdecu;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(3); ctx.fpu_reg(3) = _t; }
     ctx.last_pc = 0x001bbdeeu;
     ctx.fpu_reg(0) = ctx.fpu_reg(0) * (static_cast<double>(rdf32(0x2d1ed0u)));
     ctx.last_pc = 0x001bbdf4u;
@@ -32204,7 +32204,7 @@ L_001bbdde:;
     ctx.last_pc = 0x001bbdf6u;
     ctx.fpu_reg(0) = ctx.fpu_reg(0) * (static_cast<double>(rdf32((ctx.edi + 0x4u))));
     ctx.last_pc = 0x001bbdf9u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001bbdfbu;
     ctx.fpu_reg(0) = ctx.fpu_reg(0) * (static_cast<double>(rdf32(0x2d1ed0u)));
     ctx.last_pc = 0x001bbe01u;
@@ -32226,21 +32226,21 @@ L_001bbdde:;
     ctx.last_pc = 0x001bbe11u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) * ctx.fpu_get(3);
     ctx.last_pc = 0x001bbe13u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(4); ctx.fpu_reg(4) = _t; }
     ctx.last_pc = 0x001bbe15u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) + ctx.fpu_get(3);
     ctx.last_pc = 0x001bbe17u;
     ctx.fpu_reg(0) = ctx.fpu_reg(0) - (static_cast<double>(rdf32((ctx.esi + (ctx.ebx * 4u)))));
     ctx.last_pc = 0x001bbe1au;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(4); ctx.fpu_reg(4) = _t; }
     ctx.last_pc = 0x001bbe1cu;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(5); ctx.fpu_reg(5) = _t; }
     ctx.last_pc = 0x001bbe1eu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) + ctx.fpu_get(2);
     ctx.last_pc = 0x001bbe20u;
     ctx.fpu_reg(0) = ctx.fpu_reg(0) - (static_cast<double>(rdf32((ctx.esi + (ctx.ebx * 4u) + 0x10u))));
     ctx.last_pc = 0x001bbe24u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(5); ctx.fpu_reg(5) = _t; }
     ctx.last_pc = 0x001bbe26u;
     ctx.fpu_push(ctx.fpu_get(3));
     ctx.last_pc = 0x001bbe28u;

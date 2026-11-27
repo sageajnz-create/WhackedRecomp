@@ -119,7 +119,7 @@ bool compile_hlsl(const std::string& src, const char* entry, const char* target,
     ID3DBlob* blob = nullptr;
     ID3DBlob* err = nullptr;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr,
-                            entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &blob, &err);
+                            entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &err);
     if (FAILED(hr) || !blob) {
         std::fprintf(stderr, "[SHADER ERR %s/%s]: %s\n--- SOURCE ---\n%s\n",
                      entry, target, err ? static_cast<const char*>(err->GetBufferPointer()) : "unknown",

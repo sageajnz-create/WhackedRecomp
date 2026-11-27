@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -44,7 +45,6 @@ bool hle_input_get_port_status(int port, std::string& out_name, int16_t* out_lx,
 void hle_input_test_rumble(int port);
 bool hle_input_consume_hotplug_notice(std::string& out_msg);
 void hle_d3d8_set_hd720(bool enable);
-void audio_set_master_volume(float vol_0_to_1);
 
 namespace {
 
@@ -54,6 +54,9 @@ BackendUiType g_ui_backend = BackendUiType::None;
 std::atomic<bool> g_imgui_inited{false};
 std::atomic<bool> g_ui_wants_kb{false};
 std::atomic<bool> g_ui_wants_mouse{false};
+std::mutex g_ui_events_mutex;
+std::vector<SDL_Event> g_pending_ui_events;
+std::vector<SDL_Event> g_frame_ui_events;
 SDL_Window* g_sdl_win = nullptr;
 
 std::string g_userdata_root = "userdata";
@@ -188,7 +191,7 @@ void render_file_browser_modal() {
     }
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(760.0f, 470.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(dp(760.0f), dp(470.0f)), ImGuiCond_Appearing);
 
     if (!ImGui::BeginPopupModal("Select Whacked! ISO or Game Folder", &g_fb_open)) {
         return;
@@ -232,7 +235,7 @@ void render_file_browser_modal() {
 #endif
 
     ImGui::TextDisabled("Location: %s", g_fb_dir.string().c_str());
-    ImGui::SameLine(ImGui::GetWindowWidth() - 220.0f);
+    ImGui::SameLine(ImGui::GetWindowWidth() - dp(220.0f));
     ImGui::Checkbox("Filter ISO / Game Files", &g_fb_iso_only);
     ImGui::Separator();
 
@@ -258,7 +261,7 @@ void render_file_browser_modal() {
     std::sort(dirs.begin(), dirs.end(), cmp_name);
     std::sort(files.begin(), files.end(), cmp_name);
 
-    if (ImGui::BeginChild("FileBrowserList", ImVec2(0, -42.0f), true)) {
+    if (ImGui::BeginChild("FileBrowserList", ImVec2(0, -dp(42.0f)), true)) {
         if (g_fb_dir.has_parent_path() && g_fb_dir != g_fb_dir.parent_path()) {
             if (ImGui::Selectable("[DIR] .. (Parent Folder)", false)) {
                 nav_to(g_fb_dir.parent_path());
@@ -292,7 +295,7 @@ void render_file_browser_modal() {
     ImGui::EndChild();
 
     std::string target = g_fb_selected.empty() ? g_fb_dir.string() : g_fb_selected;
-    if (ImGui::Button("Use Selected / Current Folder", ImVec2(240.0f, 0))) {
+    if (ImGui::Button("Use Selected / Current Folder", ImVec2(dp(240.0f), 0))) {
         if (try_mount_game_source(target)) {
             g_ui_toast = "Verified & mounted Whacked!";
             g_ui_toast_until = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() + 4.0;
@@ -309,7 +312,7 @@ void render_file_browser_modal() {
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(100.0f, 0))) {
+    if (ImGui::Button("Cancel", ImVec2(dp(100.0f), 0))) {
         g_fb_open = false;
         ImGui::CloseCurrentPopup();
     }
@@ -446,7 +449,7 @@ void render_graphics_tab() {
         }
         gfx_set_fullscreen(cfg.fullscreen);
     }
-    ImGui::SameLine(280.0f);
+    ImGui::SameLine(dp(310.0f));
     if (ImGui::Checkbox("Show Performance HUD", &cfg.show_fps)) {
         push_gfx_settings_to_renderer(false);
     }
@@ -468,19 +471,19 @@ void render_graphics_tab() {
     ImGui::Spacing();
 
     if (ImGui::Checkbox("True 16:9 Hor+ Widescreen", &cfg.widescreen)) push_gfx_settings_to_renderer(false);
-    ImGui::SameLine(280.0f);
+    ImGui::SameLine(dp(310.0f));
     if (ImGui::Checkbox("Enable 720p Native Flag", &cfg.hd720)) push_gfx_settings_to_renderer(false);
 
     if (ImGui::Checkbox("Unstretched 4:3 HUD Overlay", &cfg.unstretched_hud)) push_gfx_settings_to_renderer(false);
-    ImGui::SameLine(280.0f);
+    ImGui::SameLine(dp(310.0f));
     if (ImGui::Checkbox("4x MSAA Anti-Aliasing", &cfg.msaa_4x)) push_gfx_settings_to_renderer(false);
 
     if (ImGui::Checkbox("16x Anisotropic Filtering", &cfg.aniso_16x)) push_gfx_settings_to_renderer(false);
-    ImGui::SameLine(280.0f);
+    ImGui::SameLine(dp(310.0f));
     if (ImGui::Checkbox("Post-FX Bloom & Sharpen", &cfg.bloom_sharpen)) push_gfx_settings_to_renderer(false);
 
     if (ImGui::Checkbox("Vertical Sync (VSync)", &cfg.vsync)) push_gfx_settings_to_renderer(false);
-    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SetNextItemWidth(dp(260.0f));
     const char* cap_label = (cfg.fps_cap <= 0) ? "Uncapped" : "%d FPS";
     if (ImGui::SliderInt("Frame Rate Cap", &cfg.fps_cap, 0, 240, cap_label)) {
         push_gfx_settings_to_renderer(false);
@@ -493,14 +496,19 @@ void render_audio_tab() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (ImGui::SliderFloat("Master Volume", &cfg.master_volume, 0.0f, 1.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp)) {
-        audio_set_master_volume(cfg.muted ? 0.0f : cfg.master_volume);
-    }
-    ImGui::SliderFloat("Sound Effects Volume", &cfg.sfx_volume, 0.0f, 1.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SliderFloat("Music & Bink Video Volume", &cfg.music_volume, 0.0f, 1.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp);
+    auto volume_slider = [](const char* label, float& gain) {
+        int percent = static_cast<int>(std::lround(gain * 100.0f));
+        if (!ImGui::SliderInt(label, &percent, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) return false;
+        gain = percent / 100.0f;
+        return true;
+    };
+    bool changed = volume_slider("Master Volume", cfg.master_volume);
+    changed |= volume_slider("Sound Effects Volume", cfg.sfx_volume);
+    changed |= volume_slider("Music & Bink Video Volume", cfg.music_volume);
     ImGui::Spacing();
-    if (ImGui::Checkbox("Mute All Audio", &cfg.muted)) {
-        audio_set_master_volume(cfg.muted ? 0.0f : cfg.master_volume);
+    changed |= ImGui::Checkbox("Mute All Audio", &cfg.muted);
+    if (changed) {
+        audio_set_mix_levels(cfg.master_volume, cfg.sfx_volume, cfg.music_volume, cfg.muted);
     }
 }
 
@@ -538,7 +546,7 @@ void render_controllers_tab() {
         uint32_t mask = 0;
         bool connected = hle_input_get_port_status(p, pname, &lx, &ly, &rx, &ry, &mask);
         if (p % 2 == 1) ImGui::SameLine();
-        ImGui::BeginChild(("pad_card_" + std::to_string(p)).c_str(), ImVec2(0, 56.0f), true);
+        ImGui::BeginChild(("pad_card_" + std::to_string(p)).c_str(), ImVec2(0, dp(56.0f)), true);
         if (connected) {
             ImGui::TextColored(ImVec4(0.25f, 0.92f, 0.48f, 1.0f), "Port %d:", p + 1);
             ImGui::SameLine();
@@ -556,11 +564,11 @@ void render_controllers_tab() {
     uint32_t bmask = 0;
     hle_input_get_port_status(0, p1_name, &lx, &ly, &rx, &ry, &bmask);
 
-    ImGui::BeginChild("PadLiveAndCalib", ImVec2(0, 155.0f), true);
+    ImGui::BeginChild("PadLiveAndCalib", ImVec2(0, dp(155.0f)), true);
     draw_stick_widget("Left Stick", lx, ly);
-    ImGui::SameLine(0, 16.0f);
+    ImGui::SameLine(0, dp(16.0f));
     draw_stick_widget("Right Stick", rx, ry);
-    ImGui::SameLine(0, 24.0f);
+    ImGui::SameLine(0, dp(24.0f));
 
     ImGui::BeginGroup();
     auto led = [&](const char* txt, uint32_t bit, ImVec4 col) {
@@ -601,22 +609,22 @@ void render_controllers_tab() {
     led("BACK", 0x20u, ImVec4(0.2f, 0.8f, 0.4f, 1.0f));
 
     ImGui::Spacing();
-    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SetNextItemWidth(dp(200.0f));
     ImGui::SliderFloat("Left Deadzone", &cfg.deadzone_left, 0.0f, 0.45f, "%.2f");
-    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SetNextItemWidth(dp(200.0f));
     ImGui::SliderFloat("Right Deadzone", &cfg.deadzone_right, 0.0f, 0.45f, "%.2f");
-    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SetNextItemWidth(dp(200.0f));
     ImGui::SliderFloat("Right Stick Sens", &cfg.cam_sensitivity, 0.25f, 2.50f, "%.2fx");
     ImGui::Checkbox("Invert Camera Y Axis", &cfg.invert_cam_y);
     const char* presets[] = {"Auto (Hardware Detect)", "PlayStation (Cross/Circle)", "Nintendo (Swap A/B, X/Y)"};
-    ImGui::SetNextItemWidth(220.0f);
+    ImGui::SetNextItemWidth(dp(220.0f));
     ImGui::Combo("Glyph / Button Preset", &cfg.pad_preset, presets, 3);
     ImGui::EndGroup();
 
-    ImGui::SameLine(0, 20.0f);
+    ImGui::SameLine(0, dp(20.0f));
     ImGui::BeginGroup();
     ImGui::Checkbox("Enable Rumble", &cfg.rumble_enabled);
-    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SetNextItemWidth(dp(160.0f));
     ImGui::SliderFloat("Rumble Power", &cfg.rumble_strength, 0.0f, 1.5f, "%.0f%%");
     if (ImGui::Button("Test Port 1 Rumble")) {
         hle_input_test_rumble(0);
@@ -644,7 +652,7 @@ void render_controllers_tab() {
         {"Start", &cfg.keys.start},              {"Back", &cfg.keys.back},
     };
 
-    if (ImGui::BeginTable("KeyBindTbl", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 150.0f))) {
+    if (ImGui::BeginTable("KeyBindTbl", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, dp(150.0f)))) {
         for (int i = 0; i < 22; ++i) {
             if (i % 2 == 0) ImGui::TableNextRow();
             ImGui::TableSetColumnIndex((i % 2) * 2);
@@ -653,7 +661,7 @@ void render_controllers_tab() {
             bool capturing = (g_rebinding_key == rows[i].scancode);
             const char* kname = capturing ? "[ Press Key... ]" : SDL_GetScancodeName(static_cast<SDL_Scancode>(*rows[i].scancode));
             std::string btn_id = std::string(kname && kname[0] ? kname : "Unbound") + "##kb_" + std::to_string(i);
-            if (ImGui::Button(btn_id.c_str(), ImVec2(125.0f, 0))) {
+            if (ImGui::Button(btn_id.c_str(), ImVec2(dp(125.0f), 0))) {
                 g_rebinding_key = rows[i].scancode;
                 g_rebinding_label = rows[i].name;
             }
@@ -676,7 +684,7 @@ void render_multiplayer_tab() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::SetNextItemWidth(240.0f);
+    ImGui::SetNextItemWidth(dp(240.0f));
     if (ImGui::InputText("Player Handle", g_name_buf, sizeof(g_name_buf))) {
         cfg.player_name = g_name_buf;
     }
@@ -686,11 +694,11 @@ void render_multiplayer_tab() {
                         st.local_lan_ip.empty() ? "Detecting..." : st.local_lan_ip.c_str());
 
     ImGui::Spacing();
-    ImGui::BeginChild("NetModeBar", ImVec2(0, 128.0f), true);
+    ImGui::BeginChild("NetModeBar", ImVec2(0, dp(128.0f)), true);
     ImGui::Text("Tunnel Status: ");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.28f, 0.92f, 0.50f, 1.0f), "%s", st.status_text.c_str());
-    ImGui::SameLine(ImGui::GetWindowWidth() - 220.0f);
+    ImGui::SameLine(ImGui::GetWindowWidth() - dp(220.0f));
     ImGui::TextDisabled("TX: %llu pkts   RX: %llu pkts",
                         static_cast<unsigned long long>(st.tx_packets),
                         static_cast<unsigned long long>(st.rx_packets));
@@ -700,18 +708,18 @@ void render_multiplayer_tab() {
         cfg.mp_mode = 0;
         net_start_offline_lan(cfg.player_name);
     }
-    ImGui::SameLine(230.0f);
+    ImGui::SameLine(dp(230.0f));
     if (ImGui::RadioButton("Host Online Room", cfg.mp_mode == 1)) {
         cfg.mp_mode = 1;
     }
-    ImGui::SameLine(430.0f);
+    ImGui::SameLine(dp(440.0f));
     if (ImGui::RadioButton("Join Friend's Room", cfg.mp_mode == 2)) {
         cfg.mp_mode = 2;
     }
 
     ImGui::Spacing();
     if (cfg.mp_mode == 1) {
-        ImGui::SetNextItemWidth(110.0f);
+        ImGui::SetNextItemWidth(dp(110.0f));
         ImGui::InputInt("UDP Port", &cfg.mp_tunnel_port, 0, 0);
         cfg.mp_tunnel_port = std::clamp(cfg.mp_tunnel_port, 1024, 65535);
         ImGui::SameLine();
@@ -742,7 +750,7 @@ void render_multiplayer_tab() {
             }
         }
     } else if (cfg.mp_mode == 2) {
-        ImGui::SetNextItemWidth(300.0f);
+        ImGui::SetNextItemWidth(dp(300.0f));
         if (ImGui::InputText("Room Code or IP:Port", g_join_buf, sizeof(g_join_buf))) {
             cfg.mp_join_code = g_join_buf;
         }
@@ -768,7 +776,7 @@ void render_multiplayer_tab() {
 
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(0.24f, 0.90f, 0.45f, 1.0f), "Connected Players (%zu)", peers.size());
-    if (ImGui::BeginTable("PeerTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, 120.0f))) {
+    if (ImGui::BeginTable("PeerTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, dp(120.0f)))) {
         ImGui::TableSetupColumn("Player");
         ImGui::TableSetupColumn("Virtual Xbox IP");
         ImGui::TableSetupColumn("Ping");
@@ -921,19 +929,19 @@ void render_launcher_window() {
                 ImGui::Separator();
                 ImGui::Spacing();
 
-                float btn_area = 335.0f;
+                float btn_area = dp(335.0f);
 #ifdef _WIN32
-                btn_area = 435.0f;
+                btn_area = dp(435.0f);
 #endif
-                ImGui::SetNextItemWidth(std::max(220.0f, ImGui::GetContentRegionAvail().x - btn_area));
+                ImGui::SetNextItemWidth(std::max(dp(220.0f), ImGui::GetContentRegionAvail().x - btn_area));
                 ImGui::InputText("##IsoPathInput", g_iso_buf, sizeof(g_iso_buf));
                 ImGui::SameLine();
-                if (ImGui::Button("Browse...", ImVec2(100.0f, 0))) {
+                if (ImGui::Button("Browse...", ImVec2(dp(100.0f), 0))) {
                     open_file_browser();
                 }
 #ifdef _WIN32
                 ImGui::SameLine();
-                if (ImGui::Button("OS Picker", ImVec2(95.0f, 0))) {
+                if (ImGui::Button("OS Picker", ImVec2(dp(95.0f), 0))) {
                     OPENFILENAMEA ofn{};
                     char file_out[512]{};
                     std::snprintf(file_out, sizeof(file_out), "%s", g_iso_buf);
@@ -949,7 +957,7 @@ void render_launcher_window() {
                 }
 #endif
                 ImGui::SameLine();
-                if (ImGui::Button("Auto-Find", ImVec2(95.0f, 0))) {
+                if (ImGui::Button("Auto-Find", ImVec2(dp(95.0f), 0))) {
                     auto found = xiso_auto_discover(fs::path(g_userdata_root).parent_path().string());
                     if (!found.empty() && try_mount_game_source(found.front())) {
                         set_toast("Found & mounted: " + found.front(), 4.0);
@@ -958,7 +966,7 @@ void render_launcher_window() {
                     }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Verify", ImVec2(95.0f, 0))) {
+                if (ImGui::Button("Verify", ImVec2(dp(95.0f), 0))) {
                     try_mount_game_source(g_iso_buf);
                     set_toast(g_iso_ok ? "Verified & mounted Whacked!" : g_iso_detail, 4.0);
                 }
@@ -1243,10 +1251,7 @@ void ui_shutdown() {
     g_ui_backend = BackendUiType::None;
 }
 
-void ui_process_sdl_event(const void* ev_ptr) {
-    if (!ev_ptr) return;
-    const auto* ev = static_cast<const SDL_Event*>(ev_ptr);
-
+static void process_ui_event(const SDL_Event* ev) {
     if (ev->type == SDL_KEYDOWN && !ev->key.repeat) {
         if (g_rebinding_key) {
             if (ev->key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
@@ -1269,8 +1274,30 @@ void ui_process_sdl_event(const void* ev_ptr) {
         }
     }
 
-    if (g_imgui_inited) {
-        ImGui_ImplSDL2_ProcessEvent(ev);
+    ImGui_ImplSDL2_ProcessEvent(ev);
+}
+
+void ui_process_sdl_event(const void* ev_ptr) {
+    if (!ev_ptr || !g_imgui_inited) return;
+    const auto& event = *static_cast<const SDL_Event*>(ev_ptr);
+    // SDL pumps events on the main thread. ImGui consumes them on the thread rendering the frame.
+    switch (event.type) {
+    case SDL_MOUSEMOTION:
+    case SDL_MOUSEWHEEL:
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP:
+    case SDL_TEXTINPUT:
+    case SDL_KEYDOWN:
+    case SDL_KEYUP:
+    case SDL_WINDOWEVENT:
+    case SDL_CONTROLLERDEVICEADDED:
+    case SDL_CONTROLLERDEVICEREMOVED: {
+        std::lock_guard<std::mutex> lock(g_ui_events_mutex);
+        g_pending_ui_events.push_back(event);
+        break;
+    }
+    default:
+        break;
     }
 }
 
@@ -1310,6 +1337,12 @@ bool ui_is_overlay_open() { return g_overlay_open; }
 
 void ui_render_frame(bool is_opengl) {
     if (!g_imgui_inited) return;
+    {
+        std::lock_guard<std::mutex> lock(g_ui_events_mutex);
+        g_frame_ui_events.swap(g_pending_ui_events);
+    }
+    for (const auto& event : g_frame_ui_events) process_ui_event(&event);
+    g_frame_ui_events.clear();
     ensure_ui_art_loaded();
 
     std::string hp_msg;

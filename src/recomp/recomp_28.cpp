@@ -31996,7 +31996,7 @@ L_001bb551:;
     ctx.last_pc = 0x001bb551u;
     ctx.fpu_push(0.69314718055994530942);
     ctx.last_pc = 0x001bb553u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001bb555u;
     { double _x = ctx.fpu_pop(); ctx.fpu_reg(0) = ctx.fpu_get(0) * std::log2(_x); }
     ctx.last_pc = 0x001bb557u;
@@ -32166,7 +32166,7 @@ L_001bce40:;
     ctx.last_pc = 0x001bce48u;
     ctx.fpu_push(0.30102999566398119521);
     ctx.last_pc = 0x001bce4au;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001bce4cu;
     { double _x = ctx.fpu_pop(); ctx.fpu_reg(0) = ctx.fpu_get(0) * std::log2(_x); }
     ctx.last_pc = 0x001bce4eu;
@@ -32403,7 +32403,7 @@ L_001bf4f3:;
     ctx.last_pc = 0x001bf53au;
     ctx.fpu_reg(0) = ctx.fpu_reg(0) * (static_cast<double>(rdf32((ctx.edi + (ctx.esi * 8u)))));
     ctx.last_pc = 0x001bf53du;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001bf53fu;
     ctx.fpu_reg(0) = ctx.fpu_reg(0) * (static_cast<double>(rdf32((ctx.edi + (ctx.esi * 8u) + 0x4u))));
     ctx.last_pc = 0x001bf543u;
@@ -35269,7 +35269,7 @@ void fn_001e6330(CpuContext& ctx) {
     ctx.last_pc = 0x001e63bau;
     wrf32((ctx.eax + 0x4u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e63bdu;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e63bfu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e63c1u;
@@ -35552,7 +35552,7 @@ L_001e6480:;
     ctx.last_pc = 0x001e6597u;
     wrf32((ctx.edi + 0x4u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e659au;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e659cu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e659eu;
@@ -35874,7 +35874,7 @@ L_001e6480:;
     ctx.last_pc = 0x001e678du;
     ctx.ebp = (rd32((ctx.esp + 0x70u)));
     ctx.last_pc = 0x001e6791u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e6793u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e6795u;
@@ -36175,7 +36175,7 @@ L_001e68d4:;
     ctx.last_pc = 0x001e6975u;
     wrf32((ctx.eax + (ctx.ecx * 4u) + 0xfffffffcu), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e6979u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e697bu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e697du;
@@ -36319,7 +36319,7 @@ L_001e68d4:;
     ctx.last_pc = 0x001e6a52u;
     wrf32((ctx.eax + (ctx.ecx * 4u) + 0x4u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e6a56u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e6a58u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e6a5au;
@@ -36443,7 +36443,7 @@ L_001e68d4:;
     ctx.last_pc = 0x001e6b21u;
     wrf32((ctx.eax + (ctx.ecx * 4u) + 0xcu), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e6b25u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e6b27u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e6b29u;
@@ -36479,17 +36479,17 @@ L_001e68d4:;
     ctx.last_pc = 0x001e6b55u;
     wrf32((ctx.eax + (ctx.esi * 4u) + 0x8u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e6b59u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e6b5bu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) * ctx.fpu_get(2);
     ctx.last_pc = 0x001e6b5du;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(3); ctx.fpu_reg(3) = _t; }
     ctx.last_pc = 0x001e6b5fu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) * ctx.fpu_get(1);
     ctx.last_pc = 0x001e6b61u;
     { double _r = ctx.fpu_get(3) + ctx.fpu_get(0); ctx.fpu_reg(3) = _r; ctx.fpu_pop(); }
     ctx.last_pc = 0x001e6b63u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e6b65u;
     wrf32((ctx.eax + (ctx.esi * 4u) + 0xcu), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e6b69u;

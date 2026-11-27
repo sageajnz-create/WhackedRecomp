@@ -33355,7 +33355,7 @@ L_001d4548:;
     ctx.last_pc = 0x001d4563u;
     { double _r = ctx.fpu_get(5) - ctx.fpu_get(0); ctx.fpu_reg(5) = _r; ctx.fpu_pop(); }
     ctx.last_pc = 0x001d4565u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001d4567u;
     { double _r = ctx.fpu_get(1) * ctx.fpu_get(0); ctx.fpu_reg(1) = _r; ctx.fpu_pop(); }
     ctx.last_pc = 0x001d4569u;

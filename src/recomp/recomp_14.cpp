@@ -35497,7 +35497,7 @@ void fn_001ea110(CpuContext& ctx) {
 
 void fn_001ea124(CpuContext& ctx) {
     ctx.last_pc = 0x001ea124u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
 L_001ea126:;
     ctx.last_pc = 0x001ea126u;
     ctx.fpu_reg(0) = std::fmod(ctx.fpu_reg(0), ctx.fpu_get(1));
@@ -36201,11 +36201,11 @@ void fn_001eeacc(CpuContext& ctx) {
     ctx.last_pc = 0x001eead3u;
     ctx.fpu_reg(0) = std::fabs(ctx.fpu_reg(0));
     ctx.last_pc = 0x001eead5u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001eead7u;
     ctx.fpu_reg(0) = std::fabs(ctx.fpu_reg(0));
     ctx.last_pc = 0x001eead9u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001eeadbu;
     { double _x = ctx.fpu_pop(); double _y = ctx.fpu_get(0); ctx.fpu_reg(0) = std::atan2(_y, _x); }
     ctx.last_pc = 0x001eeaddu;

@@ -523,10 +523,24 @@ bool XisoVfs::resolve_path(const std::string& raw_path, std::string& out_dev, st
     }
     if (istarts(p, "\\device\\harddisk0\\partition")) {
         out_dev = "Z";
-        if (p.find("TDATA") != std::string::npos || p.find("tdata") != std::string::npos) out_dev = "T";
-        else if (p.find("UDATA") != std::string::npos || p.find("udata") != std::string::npos) out_dev = "U";
-        size_t pos = p.find('\\', 25);
-        out_rel = (pos != std::string::npos) ? to_lower_bs(p.substr(pos + 1)) : "";
+        size_t pos = p.find('\\', 27);
+        std::string sub = (pos != std::string::npos) ? p.substr(pos + 1) : "";
+        auto strip_prefix_component = [&](const char* prefix) {
+            size_t plen = std::strlen(prefix);
+            if (istarts(sub, prefix) && (sub.size() == plen || sub[plen] == '\\')) {
+                sub = (sub.size() > plen + 1) ? sub.substr(plen + 1) : "";
+                return true;
+            }
+            return false;
+        };
+        if (strip_prefix_component("tdata")) {
+            out_dev = "T";
+            strip_prefix_component("4d530027");
+        } else if (strip_prefix_component("udata")) {
+            out_dev = "U";
+            strip_prefix_component("4d530027");
+        }
+        out_rel = to_lower_bs(sub);
         return true;
     }
 

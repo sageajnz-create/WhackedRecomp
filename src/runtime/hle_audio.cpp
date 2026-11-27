@@ -1,11 +1,12 @@
 #include "hle_common.h"
-#include "app_config.h"
 #include <SDL.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -37,6 +38,13 @@ constexpr uint32_t FN_DSS_BASE      = 0xFE202000u;
 constexpr uint32_t FN_FXMO_BASE     = 0xFE203000u;
 
 constexpr uint32_t MIXER_RATE = 44100u;
+constexpr size_t SPEAKER_MIX_BINS = 6;
+constexpr float SFX_BUS_HEADROOM = 0.5f; // Leave 6 dB of headroom for concurrent effects.
+
+struct MixBinRouting {
+    std::array<int32_t, SPEAKER_MIX_BINS> volumes{};
+    uint32_t speakers = 0x03u; // Default stereo route: front left and right.
+};
 
 struct AudioFormat {
     uint16_t format_tag = 1; // 1 = PCM, 0x69 = Xbox ADPCM, 3 = IEEE_FLOAT
@@ -69,8 +77,7 @@ struct DSBufferState {
     int32_t volume_mb = 0;
     uint32_t headroom = 0;
     uint32_t freq_hz = 44100;
-    float pan_l = 1.0f;
-    float pan_r = 1.0f;
+    MixBinRouting routing;
     bool looping = false;
     bool paused = false;
     bool active_started = false;
@@ -84,8 +91,8 @@ struct DSStreamState {
     uint32_t cb_fn_va = 0;
     uint32_t cb_ctx_va = 0;
     int32_t volume_mb = 0;
-    float pan_l = 1.0f;
-    float pan_r = 1.0f;
+    uint32_t headroom = 0;
+    MixBinRouting routing;
     bool paused = false;
     std::vector<std::unique_ptr<PendingPacket>> pending;
 };
@@ -117,6 +124,9 @@ struct SignalItem {
 };
 
 std::mutex g_audio_mtx;
+float g_master_gain = 1.0f;
+float g_sfx_gain = 1.0f;
+float g_music_gain = 1.0f;
 SDL_AudioDeviceID g_audio_dev = 0;
 bool g_audio_init_tried = false;
 std::atomic<bool> g_silent_pump_running{false};
@@ -131,6 +141,7 @@ std::unordered_map<uint32_t, std::unique_ptr<BinkStreamState>> g_bink_streams;
 uint32_t g_next_bink_id = 1;
 
 std::vector<float> g_mix_buf;
+std::array<uint32_t, SPEAKER_MIX_BINS> g_mix_bin_headroom{};
 
 float mb_to_linear(int32_t mb) {
     if (mb >= 0) return 1.0f;
@@ -159,26 +170,41 @@ inline void sample_pcm_linear(const int16_t* pcm, size_t total_frames, uint16_t 
     }
 }
 
-void compute_mixbin_pan(uint32_t pMixBins, float& out_l, float& out_r) {
-    if (!pMixBins || !mem_ptr(pMixBins)) return;
-    uint32_t count = std::min<uint32_t>(rd32(pMixBins), 16u);
+void set_mix_bins(MixBinRouting& routing, uint32_t pMixBins, bool replace_routes) {
+    if (!pMixBins) {
+        if (replace_routes) routing = {};
+        return;
+    }
+    if (!mem_ptr(pMixBins) || !mem_ptr(pMixBins + 7u)) return;
+    // The Xbox SetMixBins count is a byte. SetMixBinVolumes uses a DWORD.
+    uint32_t count = replace_routes ? rd8(pMixBins) : rd32(pMixBins);
+    if (count > 32) return;
     uint32_t pairs_va = rd32(pMixBins + 4u);
-    if (!count || !pairs_va || !mem_ptr(pairs_va)) return;
-    float gl = 0.0f, gr = 0.0f;
-    bool has_lr = false;
+    if (count && (!pairs_va || !mem_ptr(pairs_va) || !mem_ptr(pairs_va + count * 8u - 1u))) return;
+    if (replace_routes) routing.speakers = 0;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t bin = rd32(pairs_va + i * 8u + 0u);
-        int32_t  vol = static_cast<int32_t>(rd32(pairs_va + i * 8u + 4u));
-        float g = mb_to_linear(vol);
-        // Xbox MixBins: 0=FrontL, 1=FrontR, 2=FrontC, 3=LFE, 4=BackL, 5=BackR
-        if (bin == 0 || bin == 4) { gl = std::max(gl, g); has_lr = true; }
-        else if (bin == 1 || bin == 5) { gr = std::max(gr, g); has_lr = true; }
-        else if (bin == 2) { gl = std::max(gl, g * 0.707f); gr = std::max(gr, g * 0.707f); has_lr = true; }
+        if (bin >= SPEAKER_MIX_BINS) continue;
+        routing.volumes[bin] = static_cast<int32_t>(rd32(pairs_va + i * 8u + 4u));
+        if (replace_routes) routing.speakers |= 1u << bin;
     }
-    if (has_lr) {
-        out_l = std::clamp(gl, 0.0f, 1.0f);
-        out_r = std::clamp(gr, 0.0f, 1.0f);
+}
+
+std::array<float, 2> speaker_gains(const MixBinRouting& routing, int32_t volume, uint32_t headroom) {
+    std::array<float, SPEAKER_MIX_BINS> gains{};
+    for (size_t i = 0; i < gains.size(); ++i) {
+        if (!(routing.speakers & (1u << i))) continue;
+        int64_t level = static_cast<int64_t>(volume) + routing.volumes[i] - headroom - g_mix_bin_headroom[i];
+        gains[i] = mb_to_linear(static_cast<int32_t>(std::clamp<int64_t>(level, -10000, 0)));
     }
+    // In DSSPEAKER_STEREO (0), the game pans using FL/FR (bins 0/1) while leaving unused
+    // center/surround entries active at 0 dB. Only fold center/rear when no FL/FR routes exist.
+    if (routing.speakers & 0x03u) {
+        return {gains[0], gains[1]};
+    }
+    float center = gains[2] * 0.70710678f;
+    return {std::max(gains[4] * 0.70710678f, center),
+            std::max(gains[5] * 0.70710678f, center)};
 }
 
 void decode_to_pcm16(const AudioFormat& fmt, const uint8_t* src, size_t len, std::vector<int16_t>& out);
@@ -192,16 +218,16 @@ inline float soft_limit_sample(float x) {
 
 void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
     std::vector<SignalItem> completed;
-    const AppConfig& cfg = app_config();
-    float master = cfg.muted ? 0.0f : cfg.master_volume;
-    float sfx_mul = master * cfg.sfx_volume;
-    float mus_mul = master * cfg.music_volume;
+    float master;
 
     if (g_mix_buf.size() < out_frames * 2) g_mix_buf.assign(out_frames * 2, 0.0f);
     else std::memset(g_mix_buf.data(), 0, out_frames * 2 * sizeof(float));
 
     {
         std::lock_guard<std::mutex> lk(g_audio_mtx);
+        master = g_master_gain;
+        const float sfx_mul = master > 0.0f ? g_sfx_gain * SFX_BUS_HEADROOM : 0.0f;
+        const float mus_mul = master > 0.0f ? g_music_gain : 0.0f;
 
         // 1. Mix DirectSound Buffers (SFX / UI / Lock-ring buffers)
         for (auto& kv : g_buffers) {
@@ -218,9 +244,9 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
 
             uint32_t hz = b->freq_hz ? b->freq_hz : (b->fmt.sample_rate ? b->fmt.sample_rate : MIXER_RATE);
             double step = static_cast<double>(hz) / static_cast<double>(MIXER_RATE);
-            float base_gain = mb_to_linear(b->volume_mb - static_cast<int32_t>(b->headroom)) * sfx_mul;
-            float gL = base_gain * b->pan_l;
-            float gR = base_gain * b->pan_r;
+            auto [left, right] = speaker_gains(b->routing, b->volume_mb, b->headroom);
+            float gL = left * sfx_mul;
+            float gR = right * sfx_mul;
 
             for (size_t i = 0; i < out_frames; ++i) {
                 if (b->cursor_frames >= static_cast<double>(total_frames)) {
@@ -246,9 +272,9 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
             if (st->paused || st->pending.empty()) continue;
             uint16_t ch = std::max<uint16_t>(1, st->fmt.channels);
             double step = static_cast<double>(st->fmt.sample_rate ? st->fmt.sample_rate : MIXER_RATE) / static_cast<double>(MIXER_RATE);
-            float base_gain = mb_to_linear(st->volume_mb) * mus_mul;
-            float gL = base_gain * st->pan_l;
-            float gR = base_gain * st->pan_r;
+            auto [left, right] = speaker_gains(st->routing, st->volume_mb, st->headroom);
+            float gL = left * mus_mul;
+            float gR = right * mus_mul;
 
             size_t out_i = 0;
             while (out_i < out_frames && !st->pending.empty()) {
@@ -314,7 +340,7 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
 
     if (out_stereo) {
         for (size_t i = 0; i < out_frames * 2; ++i) {
-            out_stereo[i] = static_cast<int16_t>(soft_limit_sample(g_mix_buf[i]) * 32767.0f);
+            out_stereo[i] = static_cast<int16_t>(soft_limit_sample(g_mix_buf[i]) * master * 32767.0f);
         }
     }
 }
@@ -354,7 +380,6 @@ void ensure_audio_mixer() {
                     mix_audio_frames(nullptr, 706);
                 }
             });
-            g_silent_pump_thr.detach();
         }
     }
 }
@@ -468,6 +493,8 @@ uint32_t ds_buffer_create_impl(uint32_t desc_va) {
     if (desc_va && mem_ptr(desc_va)) {
         buf->ring_bytes = rd32(desc_va + 0x08);
         buf->fmt = read_wfx(rd32(desc_va + 0x0C));
+        buf->headroom = (rd32(desc_va + 4) & 0x182010u) ? 0 : 600;
+        set_mix_bins(buf->routing, rd32(desc_va + 0x10), true);
     }
     buf->freq_hz = buf->fmt.sample_rate ? buf->fmt.sample_rate : MIXER_RATE;
     uint32_t va = xbox_guest_alloc(16, 16, true);
@@ -488,6 +515,8 @@ uint32_t ds_stream_create_impl(uint32_t desc_va) {
         st->fmt = read_wfx(rd32(desc_va + 8));
         st->cb_fn_va = rd32(desc_va + 12);
         st->cb_ctx_va = rd32(desc_va + 16);
+        st->headroom = (rd32(desc_va) & 0x182010u) ? 0 : 600;
+        set_mix_bins(st->routing, rd32(desc_va + 20), true);
     }
     uint32_t va = xbox_guest_alloc(16, 16, true);
     if (!va) return 0;
@@ -521,6 +550,14 @@ void ds_DirectSoundCreateBuffer(CpuContext& ctx) {
     hle_ret_u32(ctx, va ? XB_DS_OK : XB_E_OUTOFMEMORY, 8);
 }
 
+void ds_IDirectSound_CreateSoundBuffer(CpuContext& ctx) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    uint32_t ppBuf = hle_arg(ctx, 2);
+    uint32_t va = ds_buffer_create_impl(hle_arg(ctx, 1));
+    if (ppBuf && mem_ptr(ppBuf)) wr32(ppBuf, va);
+    hle_ret_u32(ctx, va ? XB_DS_OK : XB_E_OUTOFMEMORY, 16);
+}
+
 void ds_DirectSoundCreateStream(CpuContext& ctx) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
     uint32_t ppStr = hle_arg(ctx, 1);
@@ -546,7 +583,15 @@ void ds_IDirectSound_GetSpeakerConfig(CpuContext& ctx) {
     if (pdw && mem_ptr(pdw)) wr32(pdw, 0);
     hle_ret_u32(ctx, XB_DS_OK, 8);
 }
-void ds_IDirectSound_SetMixBinHeadroom(CpuContext& ctx) { hle_ret_u32(ctx, XB_DS_OK, 12); }
+void ds_IDirectSound_SetMixBinHeadroom(CpuContext& ctx) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    uint32_t bin = hle_arg(ctx, 1);
+    if (bin < g_mix_bin_headroom.size()) {
+        // Each step of the NV2A mix-bin headroom field shifts the signal by one bit.
+        g_mix_bin_headroom[bin] = (hle_arg(ctx, 2) & 7u) * 600u;
+    }
+    hle_ret_u32(ctx, XB_DS_OK, 12);
+}
 
 void ds_Buffer_SetBufferData(CpuContext& ctx) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
@@ -694,14 +739,14 @@ void ds_Buffer_Unlock(CpuContext& ctx) {
 void ds_Buffer_SetMixBinVolumes(CpuContext& ctx) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
     if (DSBufferState* buf = find_buffer(hle_arg(ctx, 0))) {
-        compute_mixbin_pan(hle_arg(ctx, 1), buf->pan_l, buf->pan_r);
+        set_mix_bins(buf->routing, hle_arg(ctx, 1), false);
     }
     hle_ret_u32(ctx, XB_DS_OK, 8);
 }
 void ds_Buffer_SetMixBins(CpuContext& ctx) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
     if (DSBufferState* buf = find_buffer(hle_arg(ctx, 0))) {
-        compute_mixbin_pan(hle_arg(ctx, 1), buf->pan_l, buf->pan_r);
+        set_mix_bins(buf->routing, hle_arg(ctx, 1), true);
     }
     hle_ret_u32(ctx, XB_DS_OK, 8);
 }
@@ -710,13 +755,31 @@ void ds_Buffer_SetMode_8(CpuContext& ctx)        { hle_ret_u32(ctx, XB_DS_OK, 8)
 
 void ds_Stream_SetVolume(CpuContext& ctx) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
-    if (DSStreamState* st = find_stream(hle_arg(ctx, 0))) st->volume_mb = static_cast<int32_t>(hle_arg(ctx, 1));
+    uint32_t obj = hle_arg(ctx, 0);
+    int32_t vol = static_cast<int32_t>(hle_arg(ctx, 1));
+    DSStreamState* st = find_stream(obj);
+    if (st) st->volume_mb = vol;
+    hle_ret_u32(ctx, XB_DS_OK, 8);
+}
+void ds_Stream_SetHeadroom(CpuContext& ctx) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    uint32_t obj = hle_arg(ctx, 0);
+    uint32_t hr = hle_arg(ctx, 1);
+    DSStreamState* st = find_stream(obj);
+    if (st) st->headroom = hr;
     hle_ret_u32(ctx, XB_DS_OK, 8);
 }
 void ds_Stream_SetMixBinVolumes(CpuContext& ctx) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
     if (DSStreamState* st = find_stream(hle_arg(ctx, 0))) {
-        compute_mixbin_pan(hle_arg(ctx, 1), st->pan_l, st->pan_r);
+        set_mix_bins(st->routing, hle_arg(ctx, 1), false);
+    }
+    hle_ret_u32(ctx, XB_DS_OK, 8);
+}
+void ds_Stream_SetMixBins(CpuContext& ctx) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    if (DSStreamState* st = find_stream(hle_arg(ctx, 0))) {
+        set_mix_bins(st->routing, hle_arg(ctx, 1), true);
     }
     hle_ret_u32(ctx, XB_DS_OK, 8);
 }
@@ -960,7 +1023,7 @@ void populate_vtables() {
         }
     };
     write_vtbl(VTBL_DS_VA, {
-        {0x00, ds_Object_AddRef}, {0x04, ds_Object_Release}, {0x08, ds_DirectSoundCreateBuffer},
+        {0x00, ds_Object_AddRef}, {0x04, ds_Object_Release}, {0x08, ds_IDirectSound_CreateSoundBuffer},
         {0x0C, ds_InternalStub_12}, {0x10, ds_InternalStub_8}, {0x14, ds_IDirectSound_GetSpeakerConfig},
         {0x18, ds_InternalStub_8}, {0x1C, ds_IDirectSound_DownloadEffectsImage},
     }, FN_DS_BASE);
@@ -987,6 +1050,56 @@ void populate_vtables() {
 }
 
 } // namespace
+
+#ifdef WHACKED_RUNTIME_TESTS
+std::array<float, 2> test_audio_mix_bin_gains(uint32_t routes, uint32_t volumes, uint32_t headroom) {
+    MixBinRouting routing;
+    set_mix_bins(routing, routes, true);
+    set_mix_bins(routing, volumes, false);
+    return speaker_gains(routing, 0, headroom);
+}
+
+int16_t test_audio_mix_sample(unsigned effects, bool music) {
+    for (unsigned i = 0; i < effects; ++i) {
+        auto voice = std::make_unique<DSBufferState>();
+        voice->pcm_data = {32767, 32767};
+        voice->active_started = true;
+        g_buffers[i] = std::move(voice);
+    }
+    if (music) {
+        auto stream = std::make_unique<BinkStreamState>();
+        stream->queue.push_back({{16384, 16384}, 0.0});
+        g_bink_streams[0] = std::move(stream);
+    }
+    int16_t stereo[2]{};
+    mix_audio_frames(stereo, 1);
+    g_buffers.clear();
+    g_bink_streams.clear();
+    return stereo[0];
+}
+
+int32_t test_audio_get_buffer_volume(uint32_t obj_va, bool* out_found) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    DSBufferState* b = find_buffer(obj_va);
+    if (out_found) *out_found = (b != nullptr);
+    return b ? b->volume_mb : 0;
+}
+
+int32_t test_audio_get_stream_volume(uint32_t obj_va, bool* out_found) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    DSStreamState* s = find_stream(obj_va);
+    if (out_found) *out_found = (s != nullptr);
+    return s ? s->volume_mb : 0;
+}
+
+void test_audio_clear_objects() {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    g_buffers.clear();
+    g_streams.clear();
+    g_fxmos.clear();
+    g_bink_streams.clear();
+}
+#endif
 
 uint32_t audio_bink_open_stream(uint32_t sample_rate, uint32_t channels) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
@@ -1030,23 +1143,31 @@ void audio_bink_close(uint32_t stream_id) {
     g_bink_streams.erase(stream_id);
 }
 
-void audio_set_master_volume(float vol_0_to_1) {
-    app_config().master_volume = std::clamp(vol_0_to_1, 0.0f, 1.0f);
+void audio_set_mix_levels(float master, float sfx, float music, bool muted) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    g_master_gain = muted ? 0.0f : std::clamp(master, 0.0f, 1.0f);
+    g_sfx_gain = std::clamp(sfx, 0.0f, 1.0f);
+    g_music_gain = std::clamp(music, 0.0f, 1.0f);
 }
-float audio_get_master_volume() { return app_config().master_volume; }
 
 void audio_shutdown() {
-    g_silent_pump_running = false;
-    if (g_audio_dev > 0) {
-        SDL_CloseAudioDevice(g_audio_dev);
+    SDL_AudioDeviceID device = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_audio_mtx);
+        g_audio_init_tried = true;
+        g_silent_pump_running = false;
+        device = g_audio_dev;
         g_audio_dev = 0;
     }
+    if (device > 0) SDL_CloseAudioDevice(device);
+    if (g_silent_pump_thr.joinable()) g_silent_pump_thr.join();
 }
 
 void hle_register_audio() {
     populate_vtables();
 
     recomp_register_fn(0x00265FC4u, ds_DirectSoundCreate);
+    recomp_register_fn(0x00265E0Au, ds_IDirectSound_CreateSoundBuffer);
     recomp_register_fn(0x0026600Bu, ds_DirectSoundCreateBuffer);
     recomp_register_fn(0x00266062u, ds_DirectSoundCreateStream);
     recomp_register_fn(0x0026366Eu, ds_XFileCreateMediaObject);
@@ -1056,8 +1177,10 @@ void hle_register_audio() {
     recomp_register_fn(0x00262EFCu, ds_IDirectSound_DownloadEffectsImage);
     recomp_register_fn(0x00262F8Cu, ds_IDirectSound_SetMixBinHeadroom);
 
-    recomp_register_fn(0x0026302Eu, ds_Stream_SetVolume);
-    recomp_register_fn(0x002630D6u, ds_Stream_SetMixBinVolumes);
+    recomp_register_fn(0x0026302Eu, ds_Buffer_SetVolume);
+    recomp_register_fn(0x002630BAu, ds_Buffer_SetHeadroom);
+    recomp_register_fn(0x002630D6u, ds_Buffer_SetMixBins);
+    recomp_register_fn(0x002630F2u, ds_Buffer_SetMixBinVolumes);
     recomp_register_fn(0x0026310Eu, ds_Buffer_Play);
     recomp_register_fn(0x00263156u, ds_Buffer_Stop);
     recomp_register_fn(0x002631F2u, ds_Buffer_GetStatus);
@@ -1065,13 +1188,13 @@ void hle_register_audio() {
     recomp_register_fn(0x0026322Eu, ds_Buffer_SetCurrentPosition);
     recomp_register_fn(0x0026324Au, ds_Buffer_Lock);
     recomp_register_fn(0x0026327Au, ds_Buffer_Unlock);
-    recomp_register_fn(0x0026329Au, ds_Buffer_SetVolume);
-    recomp_register_fn(0x002632B3u, ds_Buffer_SetHeadroom);
-    recomp_register_fn(0x002632B8u, ds_Buffer_SetMixBinVolumes);
-    recomp_register_fn(0x002632BDu, ds_Buffer_SetMixBins);
+    recomp_register_fn(0x0026329Au, ds_Stream_SetVolume);
+    recomp_register_fn(0x002632B3u, ds_Stream_SetHeadroom);
+    recomp_register_fn(0x002632B8u, ds_Stream_SetMixBins);
+    recomp_register_fn(0x002632BDu, ds_Stream_SetMixBinVolumes);
     recomp_register_fn(0x002632C2u, ds_Stream_Pause);
-    recomp_register_fn(0x00264CB3u, ds_Stream_SetMode_8);
-    recomp_register_fn(0x00264F2Bu, ds_Buffer_SetMode_8);
+    recomp_register_fn(0x00264CB3u, ds_Buffer_SetMode_8);
+    recomp_register_fn(0x00264F2Bu, ds_Stream_SetMode_8);
     recomp_register_fn(0x00265AD0u, ds_Buffer_SetBufferData);
     recomp_register_fn(0x00269A1Au, ds_InternalStub_4);
     recomp_register_fn(0x002679A4u, ds_StaticInit_2679A4);
@@ -1082,7 +1205,7 @@ void hle_register_audio() {
     recomp_register_fn(0x00287588u, wma_WmaCreateDecoder);
     recomp_register_fn(0x0028C0D6u, wma_dBToLinear);
 
-    std::printf("[HLE] Registered 24 DSOUND + 2 WMADEC + SDL2 Stereo Audio Mixer hooks.\n");
+    std::printf("[HLE] Registered DSOUND, WMADEC and SDL2 stereo audio mixer hooks.\n");
 }
 
 float hle_audio_soft_limit(float x) {

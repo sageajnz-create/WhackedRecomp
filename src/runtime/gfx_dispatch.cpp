@@ -248,30 +248,25 @@ GfxTransformParams gfx_compute_transform_params(const DrawStateSnapshot& st, flo
 
 void gfx_pace_frame(int fps_cap) {
     using clock = std::chrono::steady_clock;
-    static clock::time_point s_next_deadline{};
+    static clock::time_point s_last_release{};
     if (fps_cap <= 0) {
-        s_next_deadline = clock::time_point{};
+        s_last_release = clock::time_point{};
         return;
     }
 
     auto period = std::chrono::nanoseconds(1000000000LL / std::max(1, fps_cap));
     auto now = clock::now();
-    if (s_next_deadline == clock::time_point{} || (now - s_next_deadline) > period * 2) {
-        s_next_deadline = now + period;
-    } else {
-        s_next_deadline += period;
-    }
-
-    while (true) {
-        now = clock::now();
-        if (now >= s_next_deadline) break;
-        auto rem_us = std::chrono::duration_cast<std::chrono::microseconds>(s_next_deadline - now).count();
+    const auto deadline = s_last_release == clock::time_point{} ? now : s_last_release + period;
+    while (now < deadline) {
+        auto rem_us = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
         if (rem_us > 2000) {
             std::this_thread::sleep_for(std::chrono::milliseconds((rem_us - 1500) / 1000));
         } else {
             std::this_thread::yield();
         }
+        now = clock::now();
     }
+    s_last_release = now;
 }
 
 bool gfx_save_png_rgba(const std::string& path, int w, int h, const uint8_t* rgba, int stride_bytes) {

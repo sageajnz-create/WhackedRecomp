@@ -30,6 +30,7 @@
 #include "rl_achievements.h"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -381,6 +382,16 @@ HostSync get_or_create_kobj_event(uint32_t kobj_va, bool manual_reset = true, bo
     return ev;
 }
 
+std::string normalize_symlink_key(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        out.push_back((c == '/') ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    while (!out.empty() && out.back() == '\\') out.pop_back();
+    return out;
+}
+
 std::string resolve_object_attrs(uint32_t obj_attr_va) {
     if (!obj_attr_va) return {};
     uint32_t root_dir = rd32(obj_attr_va + 0);
@@ -398,11 +409,15 @@ std::string resolve_object_attrs(uint32_t obj_attr_va) {
         }
     }
     std::string combined = prefix.empty() ? name : (prefix + name);
+    std::string combined_lc = normalize_symlink_key(combined);
     std::lock_guard<std::mutex> lk(g_krnl_mtx);
     for (auto& kv : g_symlinks) {
-        if (combined.size() >= kv.first.size() &&
-            ci_strncmp(combined.c_str(), kv.first.c_str(), kv.first.size()) == 0) {
-            combined = kv.second + combined.substr(kv.first.size());
+        size_t klen = kv.first.size();
+        if (klen > 0 && combined_lc.size() >= klen &&
+            combined_lc.compare(0, klen, kv.first) == 0 &&
+            (combined_lc.size() == klen || combined_lc[klen] == '\\')) {
+            std::string tail = (combined.size() > klen) ? combined.substr(klen) : std::string{};
+            combined = kv.second + tail;
             break;
         }
     }
@@ -1001,10 +1016,16 @@ static uint32_t open_file_common(uint32_t ph, uint32_t obj_attr_va, uint32_t io_
     bool delete_on_close = (options & 0x1000u) != 0; // FILE_DELETE_ON_CLOSE
     bool non_dir_only = (options & 0x0040u) != 0;    // FILE_NON_DIRECTORY_FILE
     bool want_dir = (options & 0x01u) != 0 || (!non_dir_only && fs::is_directory(host, ec));
+    bool existed_before = fs::exists(host, ec);
     if (want_dir) {
+        if (create_mode && disp == 2 && existed_before) {
+            if (io_sb_va) { wr32(io_sb_va, STATUS_OBJECT_NAME_COLLISION_XB); wr32(io_sb_va + 4, 0); }
+            return STATUS_OBJECT_NAME_COLLISION_XB;
+        }
+        bool created_dir = false;
         if (create_mode && (disp == 2 || disp == 3 || disp == 5)) {
-            fs::create_directories(host, ec);
-        } else if (!fs::exists(host, ec)) {
+            if (!existed_before) created_dir = fs::create_directories(host, ec);
+        } else if (!existed_before) {
             if (io_sb_va) { wr32(io_sb_va, STATUS_OBJECT_NAME_NOT_FOUND_XB); wr32(io_sb_va + 4, 0); }
             return STATUS_OBJECT_NAME_NOT_FOUND_XB;
         }
@@ -1017,7 +1038,7 @@ static uint32_t open_file_common(uint32_t ph, uint32_t obj_attr_va, uint32_t io_
         obj->rel_path = rel;
         uint32_t h = alloc_handle(obj);
         if (ph) wr32(ph, h);
-        if (io_sb_va) { wr32(io_sb_va, STATUS_SUCCESS_XB); wr32(io_sb_va + 4, 1); }
+        if (io_sb_va) { wr32(io_sb_va, STATUS_SUCCESS_XB); wr32(io_sb_va + 4, created_dir ? 2u : 1u); }
         return STATUS_SUCCESS_XB;
     }
 
@@ -1073,9 +1094,15 @@ static uint32_t open_file_common(uint32_t ph, uint32_t obj_attr_va, uint32_t io_
     obj->dev = dev;
     obj->rel_path = rel;
     obj->host_handle = fh;
+    uint32_t io_info = 1u;
+    if (create_mode) {
+        if (disp == 0) io_info = existed_before ? 0u : 2u;
+        else if (disp == 2 || ((disp == 3 || disp == 5) && !existed_before)) io_info = 2u;
+        else if (disp == 4 || (disp == 5 && existed_before)) io_info = 3u;
+    }
     uint32_t h = alloc_handle(obj);
     if (ph) wr32(ph, h);
-    if (io_sb_va) { wr32(io_sb_va, STATUS_SUCCESS_XB); wr32(io_sb_va + 4, 1); }
+    if (io_sb_va) { wr32(io_sb_va, STATUS_SUCCESS_XB); wr32(io_sb_va + 4, io_info); }
     return STATUS_SUCCESS_XB;
 }
 
@@ -1601,6 +1628,7 @@ void hle_NtClose(CpuContext& ctx) {
     }
     if (o) {
         bool del = (o->kind == ObjKind::File) && o->delete_on_close && !o->is_iso && !o->dev.empty();
+        bool del_dir = o->is_dir;
         std::string del_path = del ? XisoVfs::instance().host_path_for(o->dev, o->rel_path) : std::string{};
 #ifdef _WIN32
         if (o->host_handle != HOST_INVALID_FILE) CloseHandle(o->host_handle);
@@ -1611,23 +1639,24 @@ void hle_NtClose(CpuContext& ctx) {
         delete o;
         if (del && !del_path.empty()) {
             std::error_code ec;
-            fs::remove(del_path, ec);
+            if (del_dir) fs::remove_all(del_path, ec);
+            else fs::remove(del_path, ec);
         }
     }
     hle_ret_u32(ctx, STATUS_SUCCESS_XB, 4);
 }
 
 void hle_IoCreateSymbolicLink(CpuContext& ctx) {
-    std::string link = xbox_read_ansi_string(hle_arg(ctx, 0));
+    std::string link = normalize_symlink_key(xbox_read_ansi_string(hle_arg(ctx, 0)));
     std::string target = xbox_read_ansi_string(hle_arg(ctx, 1));
-    if (!link.empty() && link.back() != '\\') link += '\\';
-    if (!target.empty() && target.back() != '\\') target += '\\';
+    for (char& c : target) if (c == '/') c = '\\';
+    while (!target.empty() && target.back() == '\\') target.pop_back();
     std::lock_guard<std::mutex> lk(g_krnl_mtx);
-    g_symlinks[link] = target;
+    if (!link.empty()) g_symlinks[link] = target;
     hle_ret_u32(ctx, STATUS_SUCCESS_XB, 8);
 }
 void hle_IoDeleteSymbolicLink(CpuContext& ctx) {
-    std::string link = xbox_read_ansi_string(hle_arg(ctx, 0));
+    std::string link = normalize_symlink_key(xbox_read_ansi_string(hle_arg(ctx, 0)));
     std::lock_guard<std::mutex> lk(g_krnl_mtx);
     g_symlinks.erase(link);
     hle_ret_u32(ctx, STATUS_SUCCESS_XB, 4);
@@ -1717,7 +1746,11 @@ void hle_PsCreateSystemThreadEx(CpuContext& ctx) {
                         tid, start_fn, start_c1, start_c2, suspended, tctx.esp);
         }
         record_hle_op(tctx, "ThreadStart", start_fn, suspended);
-        recomp_dispatch_call(tctx, start_fn);
+        try {
+            recomp_dispatch_call(tctx, start_fn);
+        } catch (const GuestPowerOff&) {
+            app_request_quit();
+        }
         {
             std::lock_guard<std::mutex> dlk(g_diag_mtx);
             g_guest_threads.erase(
@@ -1987,8 +2020,8 @@ void hle_KeBugCheck(CpuContext& ctx) {
     hle_ret(ctx, 4);
 }
 void hle_HalReturnToFirmware(CpuContext& ctx) {
-    std::printf("[KERNEL] HalReturnToFirmware(%u) - exiting cleanly.\n", hle_arg(ctx, 0));
-    std::exit(0);
+    hle_log_note("[KERNEL] HalReturnToFirmware(%u)", hle_arg(ctx, 0));
+    throw GuestPowerOff{};
 }
 
 #define DEF_STUB(NAME, RET, POP) \
@@ -2376,3 +2409,13 @@ void hle_register_kernel() {
 
     std::printf("[HLE] Patched %d Xbox Kernel IAT slots at 0x%08X\n", patched, thunk_va);
 }
+
+#ifdef WHACKED_RUNTIME_TESTS
+std::string test_kernel_resolve_attrs(uint32_t obj_attr_va) {
+    return resolve_object_attrs(obj_attr_va);
+}
+void test_kernel_io_create_symlink(CpuContext& ctx) { hle_IoCreateSymbolicLink(ctx); }
+void test_kernel_io_delete_symlink(CpuContext& ctx) { hle_IoDeleteSymbolicLink(ctx); }
+void test_kernel_nt_create_file(CpuContext& ctx) { hle_NtCreateFile(ctx); }
+void test_kernel_nt_close(CpuContext& ctx) { hle_NtClose(ctx); }
+#endif

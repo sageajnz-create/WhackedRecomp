@@ -1138,7 +1138,8 @@ def translate_insn(ins, func_insns, all_funcs, switches_in_func):
     if m == "ffree":
         return lines
     if m == "fxch":
-        i = st_index(ops[0].reg) if ops else 1
+        # Capstone may include the implicit ST(0) as the first operand.
+        i = st_index(ops[-1].reg) if ops else 1
         emit(f"{{ double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg({i}); ctx.fpu_reg({i}) = _t; }}")
         return lines
     if m in ("ficom", "ficomp"):
@@ -1173,11 +1174,6 @@ def translate_insn(ins, func_insns, all_funcs, switches_in_func):
 
 
     # --- Legacy x86: string, I/O, flag and segment-register ops (not emulated) ---
-    if m == "fxch":
-        # fxch st(0) is implicit; fxch st(i) swaps with a register
-        idx = ops[0].index if len(ops) else 0
-        emit(f"std::swap(ctx.fpu_reg(0), ctx.fpu_reg({idx}));")
-        return lines
     if m == "lcall":
         # Far call: push eip (+ cs) and jump to target (segment load not emulated).
         tgt = read_op(ops[0], 4)

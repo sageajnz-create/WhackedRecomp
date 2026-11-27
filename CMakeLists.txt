@@ -190,6 +190,7 @@ add_executable(whacked_tests
     src/runtime/xbox_mem.cpp
     src/runtime/xiso_vfs.cpp
     src/runtime/app_config.cpp
+    src/runtime/hle_kernel.cpp
     src/runtime/hle_input.cpp
     src/runtime/hle_audio.cpp
     src/runtime/hle_net.cpp
@@ -200,6 +201,7 @@ target_include_directories(whacked_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rl_achievements/include"
 )
 target_link_libraries(whacked_tests PRIVATE ${WHACKED_SDL_TARGET} rl_achievements)
+target_compile_definitions(whacked_tests PRIVATE WHACKED_RUNTIME_TESTS)
 if(WIN32)
     target_link_libraries(whacked_tests PRIVATE ws2_32 user32 winmm dbghelp)
 else()

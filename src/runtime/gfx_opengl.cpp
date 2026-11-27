@@ -1,4 +1,5 @@
 #include "gfx_backend.h"
+#include "hle_common.h"
 #include "nv2a_shaders.h"
 #include "tex_decode.h"
 #include "gl_loader.h"
@@ -475,8 +476,8 @@ void ensure_gl_rt(GpuTextureObj* t) {
     t->dirty = false;
 }
 
-void save_gl_backbuffer_png(const std::string& path) {
-    int w = g_cfg.width, h = g_cfg.height;
+void save_gl_backbuffer_png(const std::string& path, int w, int h) {
+    if (w <= 0 || h <= 0) return;
     std::vector<uint8_t> raw(size_t(w) * h * 4u);
     std::vector<uint8_t> flipped(size_t(w) * h * 4u);
     whacked_gl().glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -537,6 +538,9 @@ bool gl_init(void* sdl_win, const RendererSettings& settings) {
     std::printf("[GFX-GL] OpenGL Renderer: %s | Version: %s\n",
                 reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
                 reinterpret_cast<const char*>(glGetString(GL_VERSION)));
+    hle_log_note("[GFX] OpenGL renderer: %s | %s",
+                 reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
+                 reinterpret_cast<const char*>(glGetString(GL_VERSION)));
 
     create_targets(g_cfg.width, g_cfg.height);
     nv2a_shaders_init(nullptr, true, g_cfg.cache_dir);
@@ -718,8 +722,9 @@ void gl_draw(const DrawStateSnapshot& st) {
 
     int rt_w = to_rt ? static_cast<int>(st.custom_rt->width)  : g_cfg.width;
     int rt_h = to_rt ? static_cast<int>(st.custom_rt->height) : g_cfg.height;
-    float sx = static_cast<float>(rt_w) / std::max(1.0f, st.xb_fb_w);
-    float sy = static_cast<float>(rt_h) / std::max(1.0f, st.xb_fb_h);
+    // Render-to-texture viewports are already in the guest texture's pixels.
+    float sx = to_rt ? 1.0f : static_cast<float>(rt_w) / std::max(1.0f, st.xb_fb_w);
+    float sy = to_rt ? 1.0f : static_cast<float>(rt_h) / std::max(1.0f, st.xb_fb_h);
     int vpx = static_cast<int>(st.vp_x * sx);
     int vpw = std::max(1, static_cast<int>(st.vp_w * sx));
     int vph = std::max(1, static_cast<int>(st.vp_h * sy));
@@ -995,8 +1000,13 @@ void gl_blit_rgba_rect(const void* bgra, int src_w, int src_h, int dst_x, int ds
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, src_w, src_h, GL_BGRA, GL_UNSIGNED_BYTE, bgra);
     }
 
+    int drawable_w = g_cfg.width, drawable_h = g_cfg.height;
+    if (g_sdl_win) SDL_GL_GetDrawableSize(g_sdl_win, &drawable_w, &drawable_h);
+    if (drawable_w <= 0) drawable_w = std::max(1, g_cfg.width);
+    if (drawable_h <= 0) drawable_h = std::max(1, g_cfg.height);
+
     gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, g_cfg.width, g_cfg.height);
+    glViewport(0, 0, drawable_w, drawable_h);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -1005,16 +1015,24 @@ void gl_blit_rgba_rect(const void* bgra, int src_w, int src_h, int dst_x, int ds
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    float dw = dst_w > 0 ? static_cast<float>(dst_w) : static_cast<float>(g_cfg.width);
-    float dh = dst_h > 0 ? static_cast<float>(dst_h) : static_cast<float>(g_cfg.height);
-    if (g_cfg.unstretched_hud && dw == g_cfg.width && dh == g_cfg.height) {
+    float ref_w = static_cast<float>(std::max(1, g_cfg.width));
+    float ref_h = static_cast<float>(std::max(1, g_cfg.height));
+    float sx = static_cast<float>(drawable_w) / ref_w;
+    float sy = static_cast<float>(drawable_h) / ref_h;
+    float dx = static_cast<float>(dst_x) * sx;
+    float dy = static_cast<float>(dst_y) * sy;
+    float dw = dst_w > 0 ? static_cast<float>(dst_w) * sx : static_cast<float>(drawable_w);
+    float dh = dst_h > 0 ? static_cast<float>(dst_h) * sy : static_cast<float>(drawable_h);
+    if (g_cfg.unstretched_hud &&
+        (dst_w <= 0 || dst_w == g_cfg.width) &&
+        (dst_h <= 0 || dst_h == g_cfg.height)) {
         float asp_w = dh * (4.0f / 3.0f);
-        if (asp_w < dw) { dst_x = static_cast<int>((dw - asp_w) * 0.5f); dw = asp_w; }
+        if (asp_w < dw) { dx = (dw - asp_w) * 0.5f; dw = asp_w; }
     }
-    float x0 = (dst_x / static_cast<float>(g_cfg.width)) * 2.0f - 1.0f;
-    float x1 = ((dst_x + dw) / static_cast<float>(g_cfg.width)) * 2.0f - 1.0f;
-    float y0 = 1.0f - (dst_y / static_cast<float>(g_cfg.height)) * 2.0f;
-    float y1 = 1.0f - ((dst_y + dh) / static_cast<float>(g_cfg.height)) * 2.0f;
+    float x0 = (dx / static_cast<float>(drawable_w)) * 2.0f - 1.0f;
+    float x1 = ((dx + dw) / static_cast<float>(drawable_w)) * 2.0f - 1.0f;
+    float y0 = 1.0f - (dy / static_cast<float>(drawable_h)) * 2.0f;
+    float y1 = 1.0f - ((dy + dh) / static_cast<float>(drawable_h)) * 2.0f;
     struct QV { float x, y, u, v; uint32_t col; } verts[6] = {
         {x0, y0, 0, 0, 0xFFFFFFFFu}, {x1, y0, 1, 0, 0xFFFFFFFFu}, {x0, y1, 0, 1, 0xFFFFFFFFu},
         {x1, y0, 1, 0, 0xFFFFFFFFu}, {x1, y1, 1, 1, 0xFFFFFFFFu}, {x0, y1, 0, 1, 0xFFFFFFFFu}
@@ -1052,9 +1070,11 @@ void gl_present() {
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
+    int drawable_w = 0, drawable_h = 0;
+    SDL_GL_GetDrawableSize(g_sdl_win, &drawable_w, &drawable_h);
     if (ui_is_launcher_active()) {
         gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0, 0, g_cfg.width, g_cfg.height);
+        glViewport(0, 0, drawable_w, drawable_h);
         glClearColor(0.05f, 0.06f, 0.09f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
     } else if (g_draw_calls > 0 || g_clear_calls > 0) {
@@ -1063,7 +1083,7 @@ void gl_present() {
         gl.glBlitFramebuffer(0, 0, g_cfg.width, g_cfg.height, 0, 0, g_cfg.width, g_cfg.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
         gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0, 0, g_cfg.width, g_cfg.height);
+        glViewport(0, 0, drawable_w, drawable_h);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_STENCIL_TEST);
         glDisable(GL_CULL_FACE);
@@ -1084,11 +1104,11 @@ void gl_present() {
     }
 
     gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, g_cfg.width, g_cfg.height);
+    glViewport(0, 0, drawable_w, drawable_h);
     ui_render_frame(true);
 
     if (!g_pending_screenshot.empty()) {
-        save_gl_backbuffer_png(g_pending_screenshot);
+        save_gl_backbuffer_png(g_pending_screenshot, drawable_w, drawable_h);
         g_pending_screenshot.clear();
     }
 

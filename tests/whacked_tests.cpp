@@ -6,25 +6,36 @@
 #include "runtime/xiso_vfs.h"
 #include "rl_achievements.h"
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
 
-// Headless runtime stubs for symbols provided by main/recomp/UI modules
-bool g_hle_trace = false;
-void recomp_register_fn(uint32_t, RecompFn) {}
+std::array<float, 2> test_audio_mix_bin_gains(uint32_t routes, uint32_t volumes, uint32_t headroom);
+int16_t test_audio_mix_sample(unsigned effects, bool music);
+int32_t test_audio_get_buffer_volume(uint32_t obj_va, bool* out_found);
+int32_t test_audio_get_stream_volume(uint32_t obj_va, bool* out_found);
+void test_audio_clear_objects();
+std::string test_kernel_resolve_attrs(uint32_t obj_attr_va);
+void test_kernel_io_create_symlink(CpuContext& ctx);
+void test_kernel_io_delete_symlink(CpuContext& ctx);
+void test_kernel_nt_create_file(CpuContext& ctx);
+void test_kernel_nt_close(CpuContext& ctx);
+
+// Headless runtime stubs & function registration recorder
+static std::unordered_map<uint32_t, RecompFn> g_registered_fns;
+void recomp_register_fn(uint32_t va, RecompFn fn) { g_registered_fns[va] = fn; }
 void recomp_dispatch_call(CpuContext&, uint32_t) {}
-void hle_kernel_dump_stall_state() {}
-void hle_kernel_signal_handle(uint32_t) {}
-bool hle_file_read(uint32_t, void*, uint32_t, uint32_t*) { return false; }
-bool hle_file_seek(uint32_t, int64_t, uint32_t, uint64_t*) { return false; }
-uint64_t hle_file_size(uint32_t) { return 0; }
+void app_request_quit() {}
+extern void audio_shutdown();
 bool ui_is_launcher_active() { return false; }
 bool ui_is_overlay_open() { return false; }
 bool ui_wants_keyboard() { return false; }
@@ -94,6 +105,18 @@ void test_xiso_path_resolution() {
           "T:\\ maps to TDATA");
     CHECK(vfs.resolve_path("Z:\\scratch.tmp", dev, rel) && dev == "Z" && rel == "scratch.tmp",
           "Z:\\ maps to utility scratch drive");
+    CHECK(vfs.resolve_path("\\Device\\Harddisk0\\Partition1\\UDATA\\4d530027\\11c90f515484\\whackedsavedata.sav", dev, rel) &&
+          dev == "U" && rel == "11c90f515484\\whackedsavedata.sav",
+          "Partition1\\UDATA\\4d530027 strips device/title prefix cleanly");
+    CHECK(vfs.resolve_path("\\Device\\Harddisk0\\Partition1\\UDATA\\4d530027", dev, rel) &&
+          dev == "U" && rel.empty(),
+          "Bare Partition1\\UDATA\\4d530027 resolves to UDATA root");
+    CHECK(vfs.resolve_path("\\Device\\Harddisk0\\Partition1\\TDATA\\4d530027\\settings.cfg", dev, rel) &&
+          dev == "T" && rel == "settings.cfg",
+          "Partition1\\TDATA\\4d530027 maps to TDATA root");
+    CHECK(vfs.resolve_path("\\Device\\Harddisk0\\Partition0\\cache\\scratch.bin", dev, rel) &&
+          dev == "Z" && rel == "cache\\scratch.bin",
+          "Partition0 maps to utility Z cache drive");
     CHECK(vfs.resolve_path("$Global\\foo", dev, rel) && dev == "iso" && rel == "global\\foo",
           "$ relative prefix maps to iso root");
 }
@@ -172,6 +195,233 @@ void test_audio_dsp_and_adpcm() {
           "Xbox 0x0069 mono ADPCM decodes 64 samples per block cleanly");
 }
 
+void test_audio_mix_bin_routing() {
+    if (!xbox_mem_init()) {
+        CHECK(false, "guest memory available for audio mix-bin test");
+        return;
+    }
+    const uint32_t routes = xbox_guest_alloc(24, 4, true);
+    const uint32_t volumes = xbox_guest_alloc(24, 4, true);
+    wr32(routes, 0xFFFFFF02u); // Count is stored in the low byte.
+    wr32(routes + 4, routes + 8);
+    wr32(routes + 8, 0);  // Front left
+    wr32(routes + 16, 1); // Front right
+    wr32(volumes, 2);
+    wr32(volumes + 4, volumes + 8);
+    wr32(volumes + 8, 0);
+    wr32(volumes + 12, static_cast<uint32_t>(-2000));
+    wr32(volumes + 16, 12); // An effects send must not replace the dry routing.
+    auto [left, right] = test_audio_mix_bin_gains(routes, volumes, 600);
+    CHECK(std::fabs(left - 0.05012f) < 0.0001f && std::fabs(right - 0.50119f) < 0.0001f,
+          "speaker updates preserve routes and apply distance attenuation and voice headroom");
+
+    wr32(routes + 8, 12);
+    wr32(routes + 16, 13);
+    auto [effects_left, effects_right] = test_audio_mix_bin_gains(routes, 0, 0);
+    CHECK(effects_left == 0.0f && effects_right == 0.0f,
+          "effects-only routing does not leak an unattenuated dry signal");
+
+    // In stereo mode, games often keep bin 2 (Center) at 0 dB alongside panned FL/FR (bins 0/1).
+    // Center must NOT fold into L/R when FL/FR routes exist, only when FL/FR are absent.
+    wr32(routes, 3);
+    wr32(routes + 8, 0);  wr32(routes + 12, static_cast<uint32_t>(-2000));
+    wr32(routes + 16, 1); wr32(routes + 20, 0);
+    wr32(routes + 24, 2); wr32(routes + 28, 0);
+    // Use volumes table for clean per-bin levels; test helper reads 24-byte allocations safely
+    const uint32_t r3 = xbox_guest_alloc(32, 4, true);
+    const uint32_t v3 = xbox_guest_alloc(32, 4, true);
+    wr32(r3, 3); wr32(r3 + 4, r3 + 8);
+    wr32(r3 + 8, 0);  wr32(r3 + 16, 1); wr32(r3 + 24, 2);
+    wr32(v3, 3); wr32(v3 + 4, v3 + 8);
+    wr32(v3 + 8, 0);  wr32(v3 + 12, static_cast<uint32_t>(-2000));
+    wr32(v3 + 16, 1); wr32(v3 + 20, 0);
+    wr32(v3 + 24, 2); wr32(v3 + 28, 0);
+    auto [st_l, st_r] = test_audio_mix_bin_gains(r3, v3, 0);
+    CHECK(std::fabs(st_l - 0.1f) < 0.01f && std::fabs(st_r - 1.0f) < 0.01f,
+          "active FL/FR stereo routes isolate left/right panning without center bleed");
+
+    wr32(r3, 1); wr32(r3 + 8, 2);
+    auto [ctr_l, ctr_r] = test_audio_mix_bin_gains(r3, v3, 0);
+    CHECK(std::fabs(ctr_l - 0.7071f) < 0.01f && std::fabs(ctr_r - 0.7071f) < 0.01f,
+          "center-only route falls back to -3 dB L/R folddown");
+    xbox_mem_shutdown();
+}
+
+void test_audio_thunk_dispatch_and_volumes() {
+    if (!xbox_mem_init()) {
+        CHECK(false, "guest memory available for audio thunk test");
+        return;
+    }
+    g_registered_fns.clear();
+    hle_register_audio();
+
+    // Buffer vs Stream thunks must never cross over onto the wrong object type
+    CHECK(g_registered_fns[0x0026302Eu] && g_registered_fns[0x0026329Au] &&
+          g_registered_fns[0x0026302Eu] != g_registered_fns[0x0026329Au],
+          "Buffer::SetVolume and Stream::SetVolume thunks map to distinct handlers");
+    CHECK(g_registered_fns[0x002630BAu] && g_registered_fns[0x002632B3u] &&
+          g_registered_fns[0x002630BAu] != g_registered_fns[0x002632B3u],
+          "Buffer::SetHeadroom and Stream::SetHeadroom thunks map to distinct handlers");
+    CHECK(g_registered_fns[0x002630D6u] && g_registered_fns[0x002632B8u] &&
+          g_registered_fns[0x002630D6u] != g_registered_fns[0x002632B8u],
+          "Buffer::SetMixBins and Stream::SetMixBins thunks map to distinct handlers");
+    CHECK(g_registered_fns[0x002630F2u] && g_registered_fns[0x002632BDu] &&
+          g_registered_fns[0x002630F2u] != g_registered_fns[0x002632BDu],
+          "Buffer::SetMixBinVolumes and Stream::SetMixBinVolumes thunks map to distinct handlers");
+    CHECK(g_registered_fns[0x00264CB3u] != nullptr && g_registered_fns[0x00264F2Bu] != nullptr,
+          "Buffer::SetMode_8 and Stream::SetMode_8 thunks are registered");
+    {
+        CpuContext mctx{};
+        mctx.esp = 0x02200000u;
+        g_registered_fns[0x00264CB3u](mctx);
+        uint32_t buf_esp = mctx.esp;
+        uint32_t buf_eax = mctx.eax;
+        mctx.esp = 0x02200000u;
+        g_registered_fns[0x00264F2Bu](mctx);
+        CHECK(buf_eax == 0u && buf_esp == 0x0220000Cu && mctx.eax == 0u && mctx.esp == 0x0220000Cu,
+              "Buffer::SetMode_8 and Stream::SetMode_8 both return DS_OK and pop 8 stack bytes");
+    }
+    CHECK(g_registered_fns[0x00265E0Au] != nullptr,
+          "IDirectSound::CreateSoundBuffer COM thunk is registered");
+
+    auto call_stdcall = [](uint32_t va, std::initializer_list<uint32_t> args) -> uint32_t {
+        CpuContext ctx{};
+        ctx.esp = 0x02200000u;
+        uint32_t i = 0;
+        for (uint32_t a : args) wr32(ctx.esp + 4u + (i++) * 4u, a);
+        g_registered_fns[va](ctx);
+        return ctx.eax;
+    };
+
+    // Create buffer via IDirectSound::CreateSoundBuffer and stream via DirectSoundCreateStream
+    uint32_t ds_va = 0, buf_va = 0, strm_va = 0;
+    const uint32_t out_ds = xbox_guest_alloc(16, 4, true);
+    const uint32_t wfx = xbox_guest_alloc(32, 4, true);
+    wr16(wfx + 0, 1); wr16(wfx + 2, 1); wr32(wfx + 4, 44100); wr32(wfx + 8, 88200);
+    wr16(wfx + 12, 2); wr16(wfx + 14, 16);
+    const uint32_t dsbd = xbox_guest_alloc(64, 4, true);
+    wr32(dsbd + 0, 44); wr32(dsbd + 8, 4096); wr32(dsbd + 12, wfx);
+    const uint32_t ds_sd = xbox_guest_alloc(64, 4, true);
+    wr32(ds_sd + 4, wfx);
+
+    CHECK(call_stdcall(0x00265FC4u, {0, out_ds, 0}) == 0u, "DirectSoundCreate succeeds");
+    ds_va = rd32(out_ds);
+    const uint32_t out_buf = xbox_guest_alloc(16, 4, true);
+    const uint32_t out_strm = xbox_guest_alloc(16, 4, true);
+    CHECK(call_stdcall(0x00265E0Au, {ds_va, dsbd, out_buf, 0}) == 0u, "IDirectSound::CreateSoundBuffer succeeds");
+    buf_va = rd32(out_buf);
+    CHECK(call_stdcall(0x00266062u, {ds_sd, out_strm, 0}) == 0u, "DirectSoundCreateStream succeeds");
+    strm_va = rd32(out_strm);
+
+    CHECK(call_stdcall(0x0026302Eu, {buf_va, static_cast<uint32_t>(-1800)}) == 0u, "Buffer SetVolume succeeds");
+    CHECK(call_stdcall(0x0026329Au, {strm_va, static_cast<uint32_t>(-2700)}) == 0u, "Stream SetVolume succeeds");
+    bool bf = false, sf = false;
+    int32_t bv = test_audio_get_buffer_volume(buf_va, &bf);
+    int32_t sv = test_audio_get_stream_volume(strm_va, &sf);
+    CHECK(bf && bv == -1800 && sf && sv == -2700,
+          "Buffer and Stream SetVolume update their respective objects cleanly");
+
+    test_audio_clear_objects();
+    xbox_mem_shutdown();
+}
+
+void test_kernel_symlinks_and_file_ops() {
+    fs::path tmp = fs::temp_directory_path() / "whacked_test_krnl";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    XisoVfs::instance().set_userdata_root(tmp.string());
+
+    if (!xbox_mem_init()) {
+        CHECK(false, "guest memory available for kernel test");
+        return;
+    }
+
+    auto make_ansi = [](const std::string& s) -> uint32_t {
+        uint32_t astr = xbox_guest_alloc(16, 4, true);
+        uint32_t buf = xbox_guest_alloc(static_cast<uint32_t>(s.size() + 4), 4, true);
+        std::memcpy(mem_ptr(buf), s.c_str(), s.size() + 1);
+        wr16(astr + 0, static_cast<uint16_t>(s.size()));
+        wr16(astr + 2, static_cast<uint16_t>(s.size() + 1));
+        wr32(astr + 4, buf);
+        return astr;
+    };
+    auto make_obj_attrs = [&](const std::string& s) -> uint32_t {
+        uint32_t oa = xbox_guest_alloc(16, 4, true);
+        wr32(oa + 0, 0);
+        wr32(oa + 4, make_ansi(s));
+        wr32(oa + 8, 0x40u);
+        return oa;
+    };
+    auto run_fn = [](void (*fn)(CpuContext&), std::initializer_list<uint32_t> args) -> uint32_t {
+        CpuContext ctx{};
+        ctx.esp = 0x02210000u;
+        uint32_t i = 0;
+        for (uint32_t a : args) wr32(ctx.esp + 4u + (i++) * 4u, a);
+        fn(ctx);
+        return ctx.eax;
+    };
+
+    // Case-insensitive symlink creation, bare drive resolution, and trailing-slash-insensitive delete
+    CHECK(run_fn(test_kernel_io_create_symlink, {make_ansi("\\??\\U:"), make_ansi("\\Device\\Harddisk0\\Partition1\\UDATA\\4d530027")}) == 0u,
+          "IoCreateSymbolicLink succeeds");
+    std::string r_bare = test_kernel_resolve_attrs(make_obj_attrs("\\??\\u:"));
+    std::string r_sub  = test_kernel_resolve_attrs(make_obj_attrs("\\??\\U:\\11c90f515484\\whackedsavedata.sav"));
+    CHECK(r_bare == "\\Device\\Harddisk0\\Partition1\\UDATA\\4d530027",
+          "Bare \\??\\u: resolves case-insensitively");
+    CHECK(r_sub == "\\Device\\Harddisk0\\Partition1\\UDATA\\4d530027\\11c90f515484\\whackedsavedata.sav",
+          "Nested \\??\\U:\\... expands symlink cleanly");
+    CHECK(run_fn(test_kernel_io_delete_symlink, {make_ansi("\\??\\U:\\")}) == 0u,
+          "IoDeleteSymbolicLink succeeds with trailing backslash");
+    std::string r_after = test_kernel_resolve_attrs(make_obj_attrs("\\??\\U:\\foo"));
+    CHECK(r_after == "\\??\\U:\\foo",
+          "Deleted symlink no longer rewrites paths");
+
+    // Directory creation collision (FILE_CREATE) & FILE_DELETE_ON_CLOSE recursive cleanup
+    uint32_t ph = xbox_guest_alloc(8, 4, true);
+    uint32_t iosb = xbox_guest_alloc(16, 4, true);
+    uint32_t oa_dir = make_obj_attrs("U:\\prof1");
+    CHECK(run_fn(test_kernel_nt_create_file, {ph, 0x100001u, oa_dir, iosb, 0, 0x10u, 3u, 2u /* FILE_CREATE */, 0x01u /* FILE_DIRECTORY_FILE */}) == 0u &&
+          rd32(iosb + 4) == 2u,
+          "NtCreateFile FILE_CREATE directory sets FILE_CREATED");
+    uint32_t h_dir = rd32(ph);
+    CHECK(run_fn(test_kernel_nt_close, {h_dir}) == 0u, "NtClose directory handle succeeds");
+    CHECK(run_fn(test_kernel_nt_create_file, {ph, 0x100001u, oa_dir, iosb, 0, 0x10u, 3u, 2u /* FILE_CREATE */, 0x01u}) == 0xC0000035u,
+          "NtCreateFile FILE_CREATE on existing directory returns collision");
+
+    // Populate child file, open dir with FILE_DELETE_ON_CLOSE (0x1000), close -> whole directory removed
+    uint32_t oa_child = make_obj_attrs("U:\\prof1\\save.dat");
+    CHECK(run_fn(test_kernel_nt_create_file, {ph, 0xC0000000u, oa_child, iosb, 0, 0x80u, 3u, 2u, 0x40u}) == 0u &&
+          rd32(iosb + 4) == 2u,
+          "NtCreateFile FILE_CREATE regular file sets FILE_CREATED");
+    run_fn(test_kernel_nt_close, {rd32(ph)});
+    CHECK(run_fn(test_kernel_nt_create_file, {ph, 0x100001u, oa_dir, iosb, 0, 0x10u, 3u, 1u /* FILE_OPEN */, 0x1001u /* DIR | DELETE_ON_CLOSE */}) == 0u,
+          "Open directory with FILE_DELETE_ON_CLOSE succeeds");
+    run_fn(test_kernel_nt_close, {rd32(ph)});
+    CHECK(!fs::exists(tmp / "UDATA" / "prof1", ec),
+          "Closing FILE_DELETE_ON_CLOSE directory removes non-empty save folder");
+
+    xbox_mem_shutdown();
+    fs::remove_all(tmp, ec);
+}
+
+void test_audio_mixer_controls() {
+    audio_set_mix_levels(1.0f, 1.0f, 1.0f, false);
+    CHECK(std::abs(test_audio_mix_sample(1, false) - 16383) <= 1,
+          "effects bus leaves headroom at 100 percent");
+    audio_set_mix_levels(0.25f, 1.0f, 1.0f, false);
+    CHECK(std::abs(test_audio_mix_sample(8, false) - 8191) <= 1,
+          "master volume caps even a heavily limited mix");
+    audio_set_mix_levels(0.5f, 0.0f, 1.0f, false);
+    CHECK(std::abs(test_audio_mix_sample(4, true) - 8191) <= 1,
+          "effects slider can silence effects independently of music");
+    audio_set_mix_levels(0.5f, 1.0f, 1.0f, true);
+    CHECK(test_audio_mix_sample(1, true) == 0, "mute silences both buses");
+    audio_set_mix_levels(0.5f, 1.0f, 1.0f, false);
+    CHECK(std::abs(test_audio_mix_sample(0, true) - 8191) <= 1,
+          "unmute restores the configured master level");
+    audio_set_mix_levels(1.0f, 1.0f, 1.0f, false);
+}
+
 void test_net_room_code_crc8() {
     std::string code;
     CHECK(net_encode_room_code("203.0.113.42", 30740, code), "encode room code succeeds");
@@ -219,9 +469,14 @@ int main() {
     test_app_config_roundtrip();
     test_input_2d_deadzone();
     test_audio_dsp_and_adpcm();
+    test_audio_mix_bin_routing();
+    test_audio_thunk_dispatch_and_volumes();
+    test_audio_mixer_controls();
+    test_kernel_symlinks_and_file_ops();
     test_net_room_code_crc8();
     test_rl_achievements_rules();
 
+    audio_shutdown();
     std::printf("\nTotal failures: %d\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

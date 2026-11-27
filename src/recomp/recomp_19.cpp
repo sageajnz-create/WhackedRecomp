@@ -35211,7 +35211,7 @@ void fn_001e5ad0(CpuContext& ctx) {
     ctx.last_pc = 0x001e5b5au;
     wrf32((ctx.eax + 0x4u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e5b5du;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e5b5fu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e5b61u;
@@ -35484,7 +35484,7 @@ L_001e5c13:;
     ctx.last_pc = 0x001e5d26u;
     wrf32((ctx.edi + 0x4u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e5d29u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e5d2bu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e5d2du;
@@ -35804,7 +35804,7 @@ L_001e5c13:;
     ctx.last_pc = 0x001e5f20u;
     ctx.ebp = (rd32((ctx.esp + 0x70u)));
     ctx.last_pc = 0x001e5f24u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e5f26u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e5f28u;
@@ -36099,7 +36099,7 @@ L_001e6063:;
     ctx.last_pc = 0x001e6102u;
     wrf32((ctx.eax + (ctx.ecx * 4u) + 0xfffffffcu), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e6106u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e6108u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e610au;
@@ -36237,7 +36237,7 @@ L_001e6063:;
     ctx.last_pc = 0x001e61d9u;
     wrf32((ctx.eax + (ctx.ecx * 4u) + 0x4u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e61ddu;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e61dfu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e61e1u;
@@ -36355,7 +36355,7 @@ L_001e6063:;
     ctx.last_pc = 0x001e62a2u;
     wrf32((ctx.eax + (ctx.ecx * 4u) + 0xcu), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e62a6u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e62a8u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) - ctx.fpu_get(2);
     ctx.last_pc = 0x001e62aau;
@@ -36387,17 +36387,17 @@ L_001e6063:;
     ctx.last_pc = 0x001e62d2u;
     wrf32((ctx.eax + (ctx.esi * 4u) + 0x8u), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e62d6u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e62d8u;
     ctx.fpu_reg(0) = ctx.fpu_get(0) * ctx.fpu_get(2);
     ctx.last_pc = 0x001e62dau;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(3); ctx.fpu_reg(3) = _t; }
     ctx.last_pc = 0x001e62dcu;
     ctx.fpu_reg(0) = ctx.fpu_get(0) * ctx.fpu_get(1);
     ctx.last_pc = 0x001e62deu;
     { double _r = ctx.fpu_get(3) + ctx.fpu_get(0); ctx.fpu_reg(3) = _r; ctx.fpu_pop(); }
     ctx.last_pc = 0x001e62e0u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(2); ctx.fpu_reg(2) = _t; }
     ctx.last_pc = 0x001e62e2u;
     wrf32((ctx.eax + (ctx.esi * 4u) + 0xcu), static_cast<float>(ctx.fpu_pop()));
     ctx.last_pc = 0x001e62e6u;

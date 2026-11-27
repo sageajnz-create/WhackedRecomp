@@ -36012,7 +36012,7 @@ L_001eea5e:;
     ctx.last_pc = 0x001eea5eu;
     ctx.fpu_push(rdf64(0x2d8a28u));
     ctx.last_pc = 0x001eea64u;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001eea66u;
     ctx.fpu_reg(0) = std::ldexp(ctx.fpu_reg(0), static_cast<int>(std::trunc(ctx.fpu_get(1))));
     ctx.last_pc = 0x001eea68u;
@@ -36040,7 +36040,7 @@ L_001eea87:;
     ctx.last_pc = 0x001eea87u;
     ctx.fpu_push(rdf64(0x2d8a20u));
     ctx.last_pc = 0x001eea8du;
-    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(0); ctx.fpu_reg(0) = _t; }
+    { double _t = ctx.fpu_reg(0); ctx.fpu_reg(0) = ctx.fpu_reg(1); ctx.fpu_reg(1) = _t; }
     ctx.last_pc = 0x001eea8fu;
     ctx.fpu_reg(0) = std::ldexp(ctx.fpu_reg(0), static_cast<int>(std::trunc(ctx.fpu_get(1))));
     ctx.last_pc = 0x001eea91u;
