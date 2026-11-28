@@ -1,4 +1,5 @@
 #include "cpu_context.h"
+#include "hle_common.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -94,6 +95,7 @@ static void dump_guest_backtrace(CpuContext& ctx, uint32_t depth_bytes) {
 }
 
 void recomp_dispatch_call(CpuContext& ctx, uint32_t target_va) {
+    if (hle_kernel_is_shutting_down()) throw GuestPowerOff{};
     uint32_t off = target_va - kLutBase;
     if (off < (kLutEnd - kLutBase)) {
         RecompFn fn = g_fn_lut[off];

@@ -29,6 +29,10 @@
 4. Plug in any controller (Xbox, PlayStation DualSense/DS4, Nintendo Switch Pro) or use Keyboard controls.
 5. Click **PLAY WHACKED!**.
 
+Windowed resolution presets fit the usable area of the current monitor, including room for the title bar and borders. Select **Vulkan** under **Graphics API (Next Launch)** and relaunch, or pass `--renderer vulkan`. Windows builds include DXVK beside the executable. Linux uses Mesa Zink and the installed Vulkan driver.
+
+Bink cutscenes and video previews use FFmpeg. Install `ffmpeg` on your `PATH`, or place it beside the WhackedRecomp executable. The game skips video playback if FFmpeg is unavailable.
+
 ### Supported Game Dumps
 - Original Xbox **XISO** (`.iso`, `.xiso.iso`)
 - Full **Redump DVD (XGD1)** `.iso`
@@ -40,6 +44,7 @@
 
 - **Cross-Platform Graphics Backends**: Hardware **Direct3D 11** (Windows default) and **OpenGL 3.3 Core** (Linux default & optional `--renderer opengl` on Windows) with **4x MSAA**, **16x Anisotropic Filtering**, custom **NV2A shader translation** (HLSL 5.0 + GLSL 330 Core), and **DXBC / GLSL program binary disk caching**.
 - **Widescreen, Ultrawide & HD Enhancements**: True **16:9 / 21:9 Hor+ widescreen**, optional **720p native Xbox mode flag**, optional **unstretched 4:3 HUD**, and a post-processing **FidelityFX-style CAS Sharpen & 8-tap Bloom** pass.
+- **Menu & Video Upscaling** uses bicubic texture filtering to smooth enlarged menu art, HUD elements, and Bink video frames on both renderers.
 - **High-DPI Launcher & In-Game Overlay**: Built-in **Dear ImGui** startup launcher with bundled Xbox-themed artwork and **`F1` / Xbox Guide / `L3+R3`** in-game pause/settings overlay featuring full gamepad navigation, diagnostics/cache tools, and `F12` PNG screenshots.
 - **RecompAchievements Ready**: Integrated `rl-achievements` (`rcheevos`) runtime supporting RetroAchievements memory rules, save-load protection, and live Rich Presence when launched via [RecompLauncher](https://recomplauncher.com).
 - **Expanded 4-Player Controller Support**: SDL2 GameController auto-detection with hot-plugging, auto Xbox / PlayStation / Nintendo button glyphs, true 2D radial deadzones, camera sensitivity & Y-inversion controls, dual-motor haptic rumble, and customizable keyboard bindings.
@@ -61,7 +66,8 @@
 | `A` / `B` / `X` / `Y` | `A` / `B` / `X` / `Y` (or Cross/Circle/Square/Triangle) | `Space` / `Left Shift` / `Q` / `E` |
 | White / Black (`LB` / `RB`) | `LB` / `RB` | `C` / `V` |
 | Left / Right Triggers | `LT` / `RT` | `F` / `R` |
-| `Start` / `Back` | `Start` / `Back` | `Enter` (`Esc`) / `Tab` (`Backspace`) |
+| `Start` / `Back` | `Start` / `Back` | `Enter` (`Esc` outside the start screen) / `Tab` (`Backspace`) |
+| **Quit Prompt (start screen)** | **Xbox B / PlayStation Circle** | **`Esc`** |
 | **In-Game Overlay** | **Guide** or **`L3 + R3`** | **`F1`** |
 | **Screenshot (PNG)** | — | **`F12`** |
 | **Fullscreen Toggle** | — | **`Alt + Enter`** |
@@ -72,10 +78,16 @@ All keyboard bindings can be remapped interactively inside the **Controllers** t
 
 ## Online Multiplayer Guide
 
-1. Open the **Multiplayer** tab in the Launcher (or press `F1` -> **Multiplayer** in-game).
-2. **Host**: Choose **Host Online Room**, enter a UDP port (default `30740`), click **Start / Restart Host**, and click **Copy Code** to share your `WHK-XXXX-XXXX-XXXX` Room Code (make sure your UDP port is reachable or UPnP succeeded).
-3. **Friends**: Choose **Join Friend's Room**, paste the `WHK-...` Room Code (or `IP:Port`), and click **Connect to Room**.
-4. Inside *Whacked!*, navigate to **Multiplayer -> System Link** and create or join a lobby normally — peers across Windows and Linux appear automatically with live ping telemetry.
+Open **Multiplayer** in the launcher or the in-game F1 menu.
+
+- **Same PC** — connect your controllers and use the game's local multiplayer.
+- **Same network** — connect every PC to the same Wi-Fi or router. Open **Multiplayer > System Link** in Whacked!. One player creates a match and the others join.
+- **Internet host** — choose **Create a room**, click **Create room**, then **Copy room code** and send it to your friends. Automatic router setup runs in the background.
+- **Internet guest** — choose **Join a friend**, click **Paste code**, then **Join room**. Wait for the connected message.
+
+Once connected, click **PLAY WHACKED!** or **Back to game**. Everyone opens **Multiplayer > System Link** inside Whacked!, where the host creates the match. The launcher room connects the PCs, and the game's System Link menu starts the match.
+
+**Connection help** includes firewall, router, and VPN guidance. **Advanced settings** contains the UDP port, UPnP option, addresses, and packet counts. Internet rooms use direct UDP connections, so some routers and mobile networks require manual port forwarding or a shared VPN network.
 
 ---
 

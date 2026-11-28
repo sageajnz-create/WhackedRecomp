@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <memory>
@@ -109,6 +110,9 @@ struct BinkStreamState {
     uint32_t channels = 2;
     float volume = 1.0f;
     bool paused = false;
+    bool closed = false;
+    uint64_t queued_frames = 0;
+    double played_src_frames = 0.0;
     struct Chunk {
         std::vector<int16_t> pcm;
         double cursor_frames = 0.0;
@@ -137,8 +141,11 @@ int g_ds_refs = 0;
 std::unordered_map<uint32_t, std::unique_ptr<DSBufferState>> g_buffers;
 std::unordered_map<uint32_t, std::unique_ptr<DSStreamState>> g_streams;
 std::unordered_map<uint32_t, std::unique_ptr<FileXmoState>>  g_fxmos;
-std::unordered_map<uint32_t, std::unique_ptr<BinkStreamState>> g_bink_streams;
+std::unordered_map<uint32_t, std::shared_ptr<BinkStreamState>> g_bink_streams;
+std::condition_variable g_bink_cv;
+std::atomic<bool> g_audio_shutting_down{false};
 uint32_t g_next_bink_id = 1;
+constexpr uint64_t MAX_BINK_BUFFERED_FRAMES = 44100u;
 
 std::vector<float> g_mix_buf;
 std::array<uint32_t, SPEAKER_MIX_BINS> g_mix_bin_headroom{};
@@ -301,6 +308,7 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
         }
 
         // 3. Mix Bink FMV Audio Streams
+        bool bink_consumed = false;
         for (auto& kv : g_bink_streams) {
             BinkStreamState* bs = kv.second.get();
             if (bs->paused || bs->queue.empty()) continue;
@@ -313,7 +321,9 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
                 auto& chunk = bs->queue.front();
                 size_t cf = chunk.pcm.size() / ch;
                 if (cf == 0 || chunk.cursor_frames >= static_cast<double>(cf)) {
+                    bs->queued_frames = (bs->queued_frames >= cf) ? (bs->queued_frames - cf) : 0;
                     bs->queue.erase(bs->queue.begin());
+                    bink_consumed = true;
                     continue;
                 }
                 while (out_i < out_frames && chunk.cursor_frames < static_cast<double>(cf)) {
@@ -322,13 +332,17 @@ void mix_audio_frames(int16_t* out_stereo, size_t out_frames) {
                                           gain, gain, g_mix_buf[out_i * 2 + 0], g_mix_buf[out_i * 2 + 1]);
                     }
                     chunk.cursor_frames += step;
+                    bs->played_src_frames += step;
                     ++out_i;
                 }
                 if (chunk.cursor_frames >= static_cast<double>(cf)) {
+                    bs->queued_frames = (bs->queued_frames >= cf) ? (bs->queued_frames - cf) : 0;
                     bs->queue.erase(bs->queue.begin());
+                    bink_consumed = true;
                 }
             }
         }
+        if (bink_consumed) g_bink_cv.notify_all();
     }
 
     // Signal completed XMediaPacket events outside g_audio_mtx
@@ -375,9 +389,19 @@ void ensure_audio_mixer() {
         std::printf("[AUDIO] No hardware audio device (%s); running headless timing pump.\n", SDL_GetError());
         if (!g_silent_pump_running.exchange(true)) {
             g_silent_pump_thr = std::thread([]() {
+                auto last = std::chrono::steady_clock::now();
+                double accum = 0.0;
                 while (g_silent_pump_running.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(16));
-                    mix_audio_frames(nullptr, 706);
+                    auto now = std::chrono::steady_clock::now();
+                    double dt = std::chrono::duration<double>(now - last).count();
+                    last = now;
+                    accum += std::min(dt, 0.1) * static_cast<double>(MIXER_RATE);
+                    size_t nf = static_cast<size_t>(accum);
+                    if (nf > 0) {
+                        accum -= static_cast<double>(nf);
+                        mix_audio_frames(nullptr, nf);
+                    }
                 }
             });
         }
@@ -1099,13 +1123,26 @@ void test_audio_clear_objects() {
     g_fxmos.clear();
     g_bink_streams.clear();
 }
+
+uint64_t test_audio_get_bink_queued_frames(uint32_t stream_id) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    auto it = g_bink_streams.find(stream_id);
+    return (it != g_bink_streams.end() && it->second) ? it->second->queued_frames : 0ull;
+}
+
+void test_audio_pump_frames(int frames) {
+    if (frames <= 0) return;
+    std::vector<int16_t> out(static_cast<size_t>(frames) * 2u, 0);
+    mix_audio_frames(out.data(), frames);
+}
 #endif
 
 uint32_t audio_bink_open_stream(uint32_t sample_rate, uint32_t channels) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
+    g_audio_shutting_down.store(false, std::memory_order_release);
     ensure_audio_mixer();
     uint32_t id = g_next_bink_id++;
-    auto st = std::make_unique<BinkStreamState>();
+    auto st = std::make_shared<BinkStreamState>();
     st->id = id;
     st->sample_rate = std::clamp<uint32_t>(sample_rate, 8000u, 96000u);
     st->channels = std::max<uint32_t>(1u, std::min<uint32_t>(2u, channels));
@@ -1115,15 +1152,23 @@ uint32_t audio_bink_open_stream(uint32_t sample_rate, uint32_t channels) {
 
 void audio_bink_push_pcm(uint32_t stream_id, const int16_t* samples, size_t byte_len) {
     if (!samples || byte_len == 0) return;
-    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    std::unique_lock<std::mutex> lk(g_audio_mtx);
     auto it = g_bink_streams.find(stream_id);
     if (it == g_bink_streams.end()) return;
-    BinkStreamState* b = it->second.get();
-    if (b->queue.size() > 64) b->queue.erase(b->queue.begin());
-    size_t count = byte_len / sizeof(int16_t);
-    BinkStreamState::Chunk ch;
-    ch.pcm.assign(samples, samples + count);
-    b->queue.push_back(std::move(ch));
+    std::shared_ptr<BinkStreamState> b = it->second;
+    uint32_t ch = std::max<uint32_t>(1u, b->channels);
+    size_t count = (byte_len / (sizeof(int16_t) * ch)) * ch;
+    size_t frames = count / ch;
+    if (frames == 0) return;
+    uint64_t limit = std::max<uint64_t>(b->sample_rate, MAX_BINK_BUFFERED_FRAMES);
+    g_bink_cv.wait(lk, [&]() {
+        return b->closed || g_audio_shutting_down.load(std::memory_order_acquire) || b->queued_frames < limit;
+    });
+    if (b->closed || g_audio_shutting_down.load(std::memory_order_acquire)) return;
+    BinkStreamState::Chunk chnk;
+    chnk.pcm.assign(samples, samples + count);
+    b->queued_frames += frames;
+    b->queue.push_back(std::move(chnk));
 }
 
 void audio_bink_set_volume(uint32_t stream_id, float vol_0_to_1) {
@@ -1138,9 +1183,36 @@ void audio_bink_pause(uint32_t stream_id, bool paused) {
     if (it != g_bink_streams.end()) it->second->paused = paused;
 }
 
-void audio_bink_close(uint32_t stream_id) {
+void audio_bink_flush(uint32_t stream_id) {
     std::lock_guard<std::mutex> lk(g_audio_mtx);
-    g_bink_streams.erase(stream_id);
+    auto it = g_bink_streams.find(stream_id);
+    if (it != g_bink_streams.end()) {
+        it->second->queue.clear();
+        it->second->queued_frames = 0;
+        it->second->played_src_frames = 0.0;
+        g_bink_cv.notify_all();
+    }
+}
+
+double audio_bink_get_clock_sec(uint32_t stream_id) {
+    std::lock_guard<std::mutex> lk(g_audio_mtx);
+    auto it = g_bink_streams.find(stream_id);
+    if (it == g_bink_streams.end() || it->second->sample_rate == 0) return -1.0;
+    return it->second->played_src_frames / static_cast<double>(it->second->sample_rate);
+}
+
+void audio_bink_close(uint32_t stream_id) {
+    {
+        std::lock_guard<std::mutex> lk(g_audio_mtx);
+        auto it = g_bink_streams.find(stream_id);
+        if (it != g_bink_streams.end()) {
+            it->second->closed = true;
+            it->second->queue.clear();
+            it->second->queued_frames = 0;
+            g_bink_streams.erase(it);
+        }
+    }
+    g_bink_cv.notify_all();
 }
 
 void audio_set_mix_levels(float master, float sfx, float music, bool muted) {
@@ -1155,10 +1227,18 @@ void audio_shutdown() {
     {
         std::lock_guard<std::mutex> lk(g_audio_mtx);
         g_audio_init_tried = true;
+        g_audio_shutting_down.store(true, std::memory_order_release);
         g_silent_pump_running = false;
+        for (auto& kv : g_bink_streams) {
+            kv.second->closed = true;
+            kv.second->queue.clear();
+            kv.second->queued_frames = 0;
+        }
+        g_bink_streams.clear();
         device = g_audio_dev;
         g_audio_dev = 0;
     }
+    g_bink_cv.notify_all();
     if (device > 0) SDL_CloseAudioDevice(device);
     if (g_silent_pump_thr.joinable()) g_silent_pump_thr.join();
 }

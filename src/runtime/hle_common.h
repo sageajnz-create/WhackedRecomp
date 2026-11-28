@@ -38,8 +38,12 @@ void hle_register_d3d8();
 void hle_register_all();
 
 void hle_kernel_update_ticks();
+void hle_kernel_request_shutdown();
+bool hle_kernel_is_shutting_down();
+bool hle_kernel_wait_for_guest_threads(uint32_t timeout_ms);
 void hle_kernel_shutdown();
 void hle_bink_shutdown();
+void hle_input_shutdown();
 
 bool hle_file_read(uint32_t handle, void* dst, uint32_t len, uint32_t* out_got);
 bool hle_file_seek(uint32_t handle, int64_t offset, uint32_t origin, uint64_t* out_pos);
@@ -47,7 +51,7 @@ uint64_t hle_file_size(uint32_t handle);
 bool hle_file_read_bink_from_handle(uint32_t handle, std::vector<uint8_t>& out_bik, uint64_t* out_off = nullptr);
 void hle_input_set_script(const std::string& spec);
 void hle_d3d8_set_hd720(bool enable);
-void hle_d3d8_mark_va_dirty(uint32_t va);
+void hle_d3d8_mark_bink_frame(uint32_t va);
 void hle_kernel_dump_stall_state();
 void hle_kernel_signal_handle(uint32_t handle);
 void hle_kernel_notify_frame();
@@ -64,4 +68,5 @@ void audio_set_mix_levels(float master, float sfx, float music, bool muted);
 size_t hle_audio_decode_xbox_adpcm(const uint8_t* src, size_t src_bytes, int channels,
                                    std::vector<int16_t>& out_pcm);
 void hle_set_log_sink(void (*sink)(const char*));
+void hle_set_thread_exit_hook(void (*hook)());
 void hle_log_note(const char* fmt, ...);

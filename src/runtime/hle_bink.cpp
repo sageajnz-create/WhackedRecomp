@@ -34,6 +34,8 @@ extern void     audio_bink_push_pcm(uint32_t stream_id, const int16_t* samples, 
 extern void     audio_bink_set_volume(uint32_t stream_id, float vol_0_to_1);
 extern void     audio_bink_pause(uint32_t stream_id, bool paused);
 extern void     audio_bink_close(uint32_t stream_id);
+extern void     audio_bink_flush(uint32_t stream_id);
+extern double   audio_bink_get_clock_sec(uint32_t stream_id);
 
 namespace {
 
@@ -46,12 +48,16 @@ struct BinkStreamState {
     double   fps = 29.97;
     bool     has_alpha = false;
     bool     has_audio = false;
+    uint32_t num_audio_tracks = 0;
+    uint32_t audio_track = 0;
     bool     video_on = true;
     bool     sound_on = true;
     bool     paused = false;
     float    volume = 1.0f;
     std::string tmp_bik_path;
     uint32_t audio_stream_id = 0;
+    bool     audio_started = false;
+    std::atomic<bool> aud_eof{false};
 
 #ifdef _WIN32
     ProcHandle vid_proc = nullptr;
@@ -77,12 +83,42 @@ struct BinkStreamState {
     bool cache_complete = false;
     bool next_ready = false;
     bool eof_reached = false;
-    std::chrono::steady_clock::time_point last_frame_tp;
+    bool clock_started = false;
+    double seek_base_sec = 0.0;
+    double last_aud_sec = 0.0;
+    bool audio_handoff_done = false;
+    std::chrono::steady_clock::time_point clock_origin{};
+    std::chrono::steady_clock::time_point paused_at_tp{};
+    std::chrono::steady_clock::time_point last_wait_tp{};
+    uint32_t wait_spins = 0;
 };
 
 std::mutex g_bink_mtx;
 std::unordered_map<uint32_t, BinkStreamState*> g_binks;
 std::atomic<uint32_t> g_bink_id{1};
+uint32_t g_pending_fps_num = 0;
+uint32_t g_pending_fps_den = 0;
+uint32_t g_pending_track_count = 1;
+uint32_t g_pending_track_0 = 0;
+
+double compute_playback_elapsed_sec(BinkStreamState* s, std::chrono::steady_clock::time_point now) {
+    double wall_sec = s->seek_base_sec + std::chrono::duration<double>(now - s->clock_origin).count();
+    if (s->audio_stream_id && s->sound_on && s->has_audio && s->audio_started) {
+        if (!s->aud_eof.load(std::memory_order_acquire)) {
+            double aud_rel = audio_bink_get_clock_sec(s->audio_stream_id);
+            if (aud_rel > 0.005) {
+                s->last_aud_sec = aud_rel;
+                return s->seek_base_sec + aud_rel;
+            }
+        } else if (!s->audio_handoff_done && s->last_aud_sec > 0.0) {
+            s->clock_origin = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(s->last_aud_sec));
+            s->audio_handoff_done = true;
+            return s->seek_base_sec + s->last_aud_sec;
+        }
+    }
+    return wall_sec;
+}
 
 std::string find_ffmpeg() {
 #ifdef _WIN32
@@ -216,6 +252,13 @@ void start_ffmpeg_decoders(BinkStreamState* s, double start_sec = 0.0) {
     s->stop_flag = false;
     s->eof_reached = false;
     s->next_ready = false;
+    s->clock_started = false;
+    s->audio_started = false;
+    s->aud_eof = false;
+    s->audio_handoff_done = false;
+    s->last_aud_sec = 0.0;
+    s->seek_base_sec = std::max(0.0, start_sec);
+    s->wait_spins = 0;
 
     std::vector<std::string> base_args = {"-loglevel", "quiet"};
     if (start_sec > 0.01) {
@@ -229,7 +272,7 @@ void start_ffmpeg_decoders(BinkStreamState* s, double start_sec = 0.0) {
 
     // Video BGRA pipe
     std::vector<std::string> vargs = base_args;
-    vargs.insert(vargs.end(), {"-f", "rawvideo", "-pix_fmt", "bgra", "-"});
+    vargs.insert(vargs.end(), {"-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "bgra", "-"});
     if (spawn_ffmpeg_pipe(vargs, s->vid_proc, s->vid_pipe)) {
         size_t frame_bytes = static_cast<size_t>(s->width) * s->height * 4u;
         if (s->cur_bgra.size() != frame_bytes) s->cur_bgra.assign(frame_bytes, 0);
@@ -288,29 +331,45 @@ void start_ffmpeg_decoders(BinkStreamState* s, double start_sec = 0.0) {
 
     // Audio s16le stereo 44100 Hz pipe (skip silent Binks cleanly)
     if (s->total_frames > 1 && s->has_audio) {
+        s->audio_stream_id = audio_bink_open_stream(44100, 2);
+        audio_bink_set_volume(s->audio_stream_id, s->sound_on ? s->volume : 0.0f);
+        audio_bink_pause(s->audio_stream_id, true);
+
         std::vector<std::string> aargs = base_args;
-        aargs.insert(aargs.end(), {"-vn", "-f", "s16le", "-ac", "2", "-ar", "44100", "-"});
+        aargs.insert(aargs.end(), {"-map", "0:a:" + std::to_string(s->audio_track),
+                                   "-f", "s16le", "-ac", "2", "-ar", "44100", "-"});
         if (spawn_ffmpeg_pipe(aargs, s->aud_proc, s->aud_pipe)) {
-            s->aud_thread = std::thread([s]() {
-                int16_t pcm[4096];
+            uint32_t sid = s->audio_stream_id;
+            s->aud_thread = std::thread([s, sid]() {
+                uint8_t raw[8196];
+                size_t carry = 0;
                 while (!s->stop_flag.load()) {
                     size_t n = 0;
-                    if (!pipe_read_chunk(s->aud_pipe, pcm, sizeof(pcm), &n) || n == 0) break;
-                    if (!s->audio_stream_id) {
-                        s->audio_stream_id = audio_bink_open_stream(44100, 2);
-                        audio_bink_set_volume(s->audio_stream_id, s->sound_on ? s->volume : 0.0f);
+                    if (!pipe_read_chunk(s->aud_pipe, raw + carry, sizeof(raw) - carry, &n) || n == 0) break;
+                    size_t total = carry + n;
+                    size_t aligned = total & ~size_t(3);
+                    if (aligned > 0) {
+                        audio_bink_push_pcm(sid, reinterpret_cast<const int16_t*>(raw), aligned);
                     }
-                    audio_bink_push_pcm(s->audio_stream_id, pcm, n);
+                    carry = total - aligned;
+                    if (carry > 0) {
+                        std::memmove(raw, raw + aligned, carry);
+                    }
                 }
+                s->aud_eof.store(true, std::memory_order_release);
             });
+        } else {
+            audio_bink_close(s->audio_stream_id);
+            s->audio_stream_id = 0;
         }
     }
-    s->last_frame_tp = std::chrono::steady_clock::now();
+    s->clock_origin = std::chrono::steady_clock::now();
 }
 
 void stop_ffmpeg_decoders(BinkStreamState* s, bool delete_tmp) {
     s->stop_flag = true;
     s->frame_cv.notify_all();
+    if (s->audio_stream_id) { audio_bink_close(s->audio_stream_id); s->audio_stream_id = 0; }
 #ifdef _WIN32
     if (s->vid_pipe) { CancelIoEx(s->vid_pipe, nullptr); CloseHandle(s->vid_pipe); s->vid_pipe = nullptr; }
     if (s->aud_pipe) { CancelIoEx(s->aud_pipe, nullptr); CloseHandle(s->aud_pipe); s->aud_pipe = nullptr; }
@@ -324,7 +383,6 @@ void stop_ffmpeg_decoders(BinkStreamState* s, bool delete_tmp) {
 #endif
     if (s->vid_thread.joinable()) s->vid_thread.join();
     if (s->aud_thread.joinable()) s->aud_thread.join();
-    if (s->audio_stream_id) { audio_bink_close(s->audio_stream_id); s->audio_stream_id = 0; }
     if (delete_tmp && !s->tmp_bik_path.empty()) {
         std::error_code ec;
         fs::remove(s->tmp_bik_path, ec);
@@ -349,8 +407,31 @@ void sync_guest_bink(BinkStreamState* s) {
 }
 
 void hle_BinkSetSoundSystem(CpuContext& ctx) { hle_ret_u32(ctx, 1, 8); }
-void hle_BinkSetFrameRate(CpuContext& ctx)   { hle_ret(ctx, 8); }
-void hle_BinkSetSoundTrack(CpuContext& ctx)  { hle_ret(ctx, 8); }
+void hle_BinkSetFrameRate(CpuContext& ctx) {
+    uint32_t rate = hle_arg(ctx, 0);
+    uint32_t div  = hle_arg(ctx, 1);
+    {
+        std::lock_guard<std::mutex> lk(g_bink_mtx);
+        g_pending_fps_num = rate;
+        g_pending_fps_den = div ? div : 1u;
+    }
+    hle_ret(ctx, 8);
+}
+void hle_BinkSetSoundTrack(CpuContext& ctx) {
+    uint32_t total     = hle_arg(ctx, 0);
+    uint32_t tracks_va = hle_arg(ctx, 1);
+    {
+        std::lock_guard<std::mutex> lk(g_bink_mtx);
+        g_pending_track_count = std::min<uint32_t>(total, 8u);
+        g_pending_track_0 = 0u;
+        if (g_pending_track_count > 0 && tracks_va && mem_ptr(tracks_va)) {
+            uint32_t t0 = rd32(tracks_va);
+            // Multi-track surround arrays in Whacked may pass [base..base+5] where track 0 is stereo mixdown.
+            g_pending_track_0 = (g_pending_track_count > 1u && t0 <= 1u) ? 0u : t0;
+        }
+    }
+    hle_ret(ctx, 8);
+}
 void hle_BinkSetIO(CpuContext& ctx)          { hle_ret(ctx, 8); }
 
 void hle_BinkOpen(CpuContext& ctx) {
@@ -412,17 +493,37 @@ void hle_BinkOpen(CpuContext& ctx) {
         uint32_t v; std::memcpy(&v, bik_bytes.data() + off, 4); return v;
     };
 
+    uint32_t req_fps_num = 0, req_fps_den = 0;
+    uint32_t req_track_count = 1, req_track_0 = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_bink_mtx);
+        if ((flags & 0x00001000u) != 0) {
+            req_fps_num = g_pending_fps_num;
+            req_fps_den = g_pending_fps_den;
+        }
+        g_pending_fps_num = 0;
+        g_pending_fps_den = 0;
+        if ((flags & 0x00004000u) != 0) {
+            req_track_count = g_pending_track_count;
+            req_track_0 = g_pending_track_0;
+        }
+        g_pending_track_count = 1u;
+        g_pending_track_0 = 0u;
+    }
+
     auto* s = new BinkStreamState();
     s->total_frames = std::max(1u, u32le(0x08));
     s->width        = std::max(16u, u32le(0x14));
     s->height       = std::max(16u, u32le(0x18));
-    uint32_t fps_n  = u32le(0x1C);
-    uint32_t fps_d  = u32le(0x20);
+    uint32_t fps_n  = (req_fps_num && req_fps_den) ? req_fps_num : u32le(0x1C);
+    uint32_t fps_d  = (req_fps_num && req_fps_den) ? req_fps_den : u32le(0x20);
     s->fps          = (fps_n && fps_d) ? (static_cast<double>(fps_n) / fps_d) : 29.97;
     if (s->fps < 5.0 || s->fps > 120.0) s->fps = 29.97;
     s->has_alpha    = ((u32le(0x24) & 0x00100000u) != 0) || ((flags & 0x00100000u) != 0);
     uint32_t num_audio = (bik_bytes.size() >= 0x2C) ? u32le(0x28) : 0u;
-    s->has_audio    = (num_audio > 0 && num_audio <= 16u);
+    s->num_audio_tracks = (num_audio <= 16u) ? num_audio : 0u;
+    s->has_audio    = (s->num_audio_tracks > 0 && req_track_count > 0);
+    s->audio_track  = (s->has_audio && req_track_0 < s->num_audio_tracks) ? req_track_0 : 0u;
     uint64_t total_raw_bytes = static_cast<uint64_t>(s->width) * s->height * 4ull * s->total_frames;
     s->cache_enabled = (total_raw_bytes <= 24ull * 1024ull * 1024ull);
 
@@ -468,14 +569,29 @@ void hle_BinkClose(CpuContext& ctx) {
 void hle_BinkWait(CpuContext& ctx) {
     BinkStreamState* s = find_bink(hle_arg(ctx, 0));
     if (!s || s->paused) { hle_ret_u32(ctx, 1, 4); return; }
+    if (s->total_frames <= 1 || !s->clock_started) {
+        s->wait_spins = 0;
+        hle_ret_u32(ctx, 0, 4);
+        return;
+    }
     auto now = std::chrono::steady_clock::now();
-    double elapsed_ms = std::chrono::duration<double, std::milli>(now - s->last_frame_tp).count();
-    double frame_ms = 1000.0 / s->fps;
-    if (elapsed_ms < frame_ms) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    double elapsed_sec = compute_playback_elapsed_sec(s, now);
+    double target_sec = static_cast<double>(s->cur_frame > 0 ? s->cur_frame - 1u : 0u) / s->fps;
+    if (elapsed_sec + 0.0005 < target_sec) {
+        if (s->last_wait_tp.time_since_epoch().count() != 0 &&
+            std::chrono::duration<double, std::milli>(now - s->last_wait_tp).count() < 1.0) {
+            if (++s->wait_spins >= 32u) {
+                s->wait_spins = 0;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        } else {
+            s->wait_spins = 0;
+        }
+        s->last_wait_tp = now;
         hle_ret_u32(ctx, 1, 4);
         return;
     }
+    s->wait_spins = 0;
     hle_ret_u32(ctx, 0, 4);
 }
 
@@ -499,7 +615,12 @@ void hle_BinkDoFrame(CpuContext& ctx) {
             }
         }
     }
-    s->last_frame_tp = std::chrono::steady_clock::now();
+    if (!s->clock_started && !s->paused) {
+        s->clock_origin = std::chrono::steady_clock::now();
+        s->clock_started = true;
+        s->audio_started = true;
+        if (s->audio_stream_id) audio_bink_pause(s->audio_stream_id, false);
+    }
     hle_ret_u32(ctx, 0, 4);
 }
 
@@ -568,7 +689,7 @@ void hle_BinkCopyToBuffer(CpuContext& ctx) {
             std::memcpy(dst + dx * 4u, src, copy_w * 4u);
         }
     }
-    hle_d3d8_mark_va_dirty(dest_va);
+    hle_d3d8_mark_bink_frame(dest_va);
     hle_ret_u32(ctx, 0, 28);
 }
 
@@ -579,9 +700,16 @@ void hle_BinkNextFrame(CpuContext& ctx) {
             s->cur_frame = 1;
         } else if (s->cur_frame >= s->total_frames) {
             s->cur_frame = 1;
+            s->clock_started = false;
+            s->audio_started = false;
+            s->last_aud_sec = 0.0;
+            s->audio_handoff_done = false;
             if (!s->cache_complete) {
                 stop_ffmpeg_decoders(s, false);
                 start_ffmpeg_decoders(s, 0.0);
+            } else {
+                s->seek_base_sec = 0.0;
+                if (s->audio_stream_id) audio_bink_flush(s->audio_stream_id);
             }
         } else {
             ++s->cur_frame;
@@ -607,8 +735,15 @@ void hle_BinkPause(CpuContext& ctx) {
     BinkStreamState* s = find_bink(hle_arg(ctx, 0));
     uint32_t pause = hle_arg(ctx, 1);
     if (s) {
-        s->paused = (pause != 0);
-        if (s->audio_stream_id) audio_bink_pause(s->audio_stream_id, s->paused);
+        bool want = (pause != 0);
+        auto now = std::chrono::steady_clock::now();
+        if (want && !s->paused) {
+            s->paused_at_tp = now;
+        } else if (!want && s->paused && s->clock_started) {
+            s->clock_origin += (now - s->paused_at_tp);
+        }
+        s->paused = want;
+        if (s->audio_stream_id) audio_bink_pause(s->audio_stream_id, s->paused || !s->audio_started);
         sync_guest_bink(s);
     }
     hle_ret_u32(ctx, pause ? 1u : 0u, 8);

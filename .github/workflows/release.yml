@@ -32,6 +32,8 @@ jobs:
           $stage = "stage_win/WhackedRecomp"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item build/WhackedRecomp.exe $stage/
+          Copy-Item -Recurse build/dxvk "$stage/dxvk"
+          Invoke-WebRequest https://raw.githubusercontent.com/doitsujin/dxvk/v2.7.1/LICENSE -OutFile "$stage/dxvk/LICENSE"
           Copy-Item recomplauncher.json, README.md, LICENSE $stage/
           Copy-Item -Recurse assets "$stage/assets"
           New-Item -ItemType Directory -Force -Path "$stage/third_party/rl_achievements" | Out-Null

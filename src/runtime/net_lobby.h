@@ -23,6 +23,8 @@ struct NetLobbyStatus {
     NetLobbyMode mode = NetLobbyMode::OfflineOrLan;
     bool active = false;
     bool upnp_mapped = false;
+    bool connected = false;
+    uint64_t waiting_seconds = 0;
     std::string local_lan_ip;
     std::string public_ip;
     std::string room_code;

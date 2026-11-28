@@ -6,6 +6,7 @@
 #include <dxgi.h>
 #include <d3dcompiler.h>
 #include "d3d11_renderer.h"
+#include <filesystem>
 #include "hle_common.h"
 #include "tex_decode.h"
 #include "launcher_ui.h"
@@ -307,8 +308,15 @@ ID3D11DepthStencilState* get_ds_state(bool zen, bool zwrite, uint32_t zfunc,
     return s;
 }
 
-ID3D11RasterizerState* get_rs_state(uint32_t cull, uint32_t fill) {
-    uint64_t k = uint64_t(cull) | (uint64_t(fill) << 8) | (g_cfg.msaa_4x ? 0x10000ull : 0ull);
+ID3D11RasterizerState* get_rs_state(uint32_t cull, uint32_t fill, bool poly_offset, float slope_scale, float depth_bias) {
+    int32_t db = poly_offset ? static_cast<int32_t>(depth_bias + (depth_bias >= 0.0f ? 0.5f : -0.5f)) : 0;
+    uint32_t sb_bits = 0;
+    if (poly_offset && slope_scale != 0.0f) std::memcpy(&sb_bits, &slope_scale, sizeof(sb_bits));
+    uint64_t k = uint64_t(cull) | (uint64_t(fill) << 8) | (g_cfg.msaa_4x ? 0x10000ull : 0ull) |
+                 (poly_offset ? 0x20000ull : 0ull);
+    if (poly_offset) {
+        k ^= (uint64_t(static_cast<uint32_t>(db)) << 20) ^ (uint64_t(sb_bits) << 40);
+    }
     auto it = g_rs_cache.find(k);
     if (it != g_rs_cache.end()) return it->second;
 
@@ -317,6 +325,8 @@ ID3D11RasterizerState* get_rs_state(uint32_t cull, uint32_t fill) {
     d.CullMode = (cull == 1) ? D3D11_CULL_NONE : (cull == 2) ? D3D11_CULL_FRONT : D3D11_CULL_BACK;
     d.FrontCounterClockwise = FALSE;
     d.DepthClipEnable = TRUE;
+    d.DepthBias = db;
+    d.SlopeScaledDepthBias = poly_offset ? slope_scale : 0.0f;
     d.MultisampleEnable = g_cfg.msaa_4x ? TRUE : FALSE;
     ID3D11RasterizerState* s = nullptr;
     g_dev->CreateRasterizerState(&d, &s);
@@ -324,8 +334,10 @@ ID3D11RasterizerState* get_rs_state(uint32_t cull, uint32_t fill) {
     return s;
 }
 
-ID3D11SamplerState* get_sampler(uint32_t au, uint32_t av, uint32_t minf, uint32_t magf) {
-    uint64_t k = uint64_t(au) | (uint64_t(av) << 4) | (uint64_t(minf) << 8) | (uint64_t(magf) << 12) | (g_cfg.aniso_16x ? 0x10000ull : 0ull);
+ID3D11SamplerState* get_sampler(uint32_t au, uint32_t av, uint32_t minf, uint32_t magf, bool upscale = false) {
+    const bool aniso = g_cfg.aniso_16x && !upscale;
+    uint64_t k = uint64_t(au) | (uint64_t(av) << 4) | (uint64_t(minf) << 8) | (uint64_t(magf) << 12) |
+                 (aniso ? 0x10000ull : 0ull) | (upscale ? 0x20000ull : 0ull);
     auto it = g_samp_cache.find(k);
     if (it != g_samp_cache.end()) return it->second;
 
@@ -334,10 +346,10 @@ ID3D11SamplerState* get_sampler(uint32_t au, uint32_t av, uint32_t minf, uint32_
     d.AddressV = d3d_addr_to_dx11(av);
     d.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
     d.MaxLOD = D3D11_FLOAT32_MAX;
-    if (g_cfg.aniso_16x && minf >= 2 && magf >= 2) {
+    if (aniso && minf >= 2 && magf >= 2) {
         d.Filter = D3D11_FILTER_ANISOTROPIC;
         d.MaxAnisotropy = 16;
-    } else if (minf <= 1 && magf <= 1) {
+    } else if (!upscale && minf <= 1 && magf <= 1) {
         d.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
         d.MaxAnisotropy = 1;
     } else {
@@ -459,7 +471,7 @@ void draw_2d_quads(const std::vector<QuadVert>& verts, ID3D11ShaderResourceView*
     g_ctx->OMSetRenderTargets(1, &g_back_rtv, nullptr);
     g_ctx->OMSetDepthStencilState(get_ds_state(false, false, 8, false, 8, 1, 1, 1, 0xFF, 0xFF), 0);
     g_ctx->OMSetBlendState(get_blend_state(true, 5, 6, 1, 0xF), nullptr, 0xFFFFFFFF);
-    g_ctx->RSSetState(get_rs_state(1, 3));
+    g_ctx->RSSetState(get_rs_state(1, 3, false, 0.0f, 0.0f));
     UINT stride = sizeof(QuadVert), off = 0;
     g_ctx->IASetInputLayout(g_quad_il);
     g_ctx->IASetVertexBuffers(0, 1, &g_quad_vb, &stride, &off);
@@ -581,17 +593,45 @@ bool d3d11_init(void* sdl_win, const RendererSettings& settings) {
     D3D_FEATURE_LEVEL fls[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
     D3D_FEATURE_LEVEL fl_out = D3D_FEATURE_LEVEL_11_0;
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+    decltype(&D3D11CreateDeviceAndSwapChain) create_device = nullptr;
+    IDXGIAdapter* vk_adapter = nullptr;
+    D3D_DRIVER_TYPE driver_type = D3D_DRIVER_TYPE_HARDWARE;
+    if (settings.backend == GfxBackendKind::Vulkan) {
+        wchar_t executable[32768]{};
+        if (!GetModuleFileNameW(nullptr, executable, 32768)) return false;
+        auto dir = std::filesystem::path(executable).parent_path() / L"dxvk";
+        HMODULE dxgi = LoadLibraryExW((dir / L"dxgi.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!dxgi) return false;
+        auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
+        IDXGIFactory1* factory = nullptr;
+        if (!create_factory || FAILED(create_factory(IID_PPV_ARGS(&factory)))) return false;
+        HRESULT enumerated = factory->EnumAdapters(0, &vk_adapter);
+        factory->Release();
+        if (FAILED(enumerated)) return false;
+        driver_type = D3D_DRIVER_TYPE_UNKNOWN;
+        HMODULE module = LoadLibraryExW((dir / L"d3d11.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (module) create_device = reinterpret_cast<decltype(create_device)>(GetProcAddress(module, "D3D11CreateDeviceAndSwapChain"));
+    } else {
+        HMODULE module = LoadLibraryExW(L"d3d11.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (module) create_device = reinterpret_cast<decltype(create_device)>(GetProcAddress(module, "D3D11CreateDeviceAndSwapChain"));
+    }
+    if (!create_device) {
+        if (vk_adapter) vk_adapter->Release();
+        return false;
+    }
+    HRESULT hr = create_device(vk_adapter, driver_type, nullptr, flags,
                                                fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl_out, &g_ctx);
     if (FAILED(hr)) {
         sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+        hr = create_device(vk_adapter, driver_type, nullptr, flags,
                                            fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl_out, &g_ctx);
     }
+    if (vk_adapter) vk_adapter->Release();
     const bool use_warp = FAILED(hr);
+    if (use_warp && settings.backend == GfxBackendKind::Vulkan) return false;
     if (use_warp) {
         hle_log_note("[GFX] D3D11 hardware initialization failed (0x%08lX), trying WARP", static_cast<unsigned long>(hr));
-        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
+        hr = create_device(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
                                            fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl_out, &g_ctx);
         if (FAILED(hr)) return false;
         std::printf("[GFX] D3D11 WARP fallback active.\n");
@@ -606,7 +646,7 @@ bool d3d11_init(void* sdl_win, const RendererSettings& settings) {
     }
     SDL_DisplayMode mode{};
     SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(g_sdl_win), &mode);
-    hle_log_note("[GFX] D3D11 driver: %s, %s, display %d Hz", use_warp ? "WARP (software)" : "hardware",
+    hle_log_note("[GFX] D3D11 driver: %s, %s, display %d Hz", settings.backend == GfxBackendKind::Vulkan ? "Vulkan (DXVK)" : (use_warp ? "WARP (software)" : "hardware"),
                  sd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ? "flip discard" : "legacy discard",
                  mode.refresh_rate);
     if (SUCCEEDED(g_dev->QueryInterface(IID_PPV_ARGS(&dxgi_device)))) {
@@ -641,7 +681,7 @@ bool d3d11_init(void* sdl_win, const RendererSettings& settings) {
     g_cb_ps_nv2a = mk_buf(352, D3D11_BIND_CONSTANT_BUFFER);
     g_cb_ff_ps   = mk_buf(112, D3D11_BIND_CONSTANT_BUFFER);
 
-    ui_set_active_backend_name("Direct3D 11 (Windows Hardware)");
+    ui_set_active_backend_name(settings.backend == GfxBackendKind::Vulkan ? "Vulkan (DXVK)" : "Direct3D 11 (Windows Hardware)");
     ui_init_dx11(sdl_win, g_dev, g_ctx);
     g_dx_owner_tid = std::this_thread::get_id();
 
@@ -851,7 +891,7 @@ void d3d11_draw(const DrawStateSnapshot& st) {
         st.stencil_enable, st.stencil_func, st.stencil_fail, st.stencil_zfail, st.stencil_pass,
         static_cast<uint8_t>(st.stencil_mask & 0xFFu), static_cast<uint8_t>(st.stencil_writemask & 0xFFu)),
         st.stencil_ref & 0xFFu);
-    g_ctx->RSSetState(get_rs_state(st.cull_mode, st.fill_mode));
+    g_ctx->RSSetState(get_rs_state(st.cull_mode, st.fill_mode, st.poly_offset_fill, st.poly_offset_scale, st.poly_offset_bias));
 
     ID3D11ShaderResourceView* srvs[4]{};
     ID3D11SamplerState* samps[4]{};
@@ -867,7 +907,7 @@ void d3d11_draw(const DrawStateSnapshot& st) {
         } else {
             srvs[s] = g_white_srv;
         }
-        samps[s] = get_sampler(st.addr_u[s], st.addr_v[s], st.min_filter[s], st.mag_filter[s]);
+        samps[s] = get_sampler(st.addr_u[s], st.addr_v[s], st.min_filter[s], st.mag_filter[s], gfx_upscale_texture(st, s));
     }
     g_ctx->PSSetShaderResources(0, 4, srvs);
     g_ctx->PSSetSamplers(0, 4, samps);
@@ -933,8 +973,10 @@ void d3d11_draw(const DrawStateSnapshot& st) {
             tex_scale[s * 4 + 0] = 1.0f;
             tex_scale[s * 4 + 1] = 1.0f;
         }
-        tex_scale[s * 4 + 2] = 1.0f;
-        tex_scale[s * 4 + 3] = 1.0f;
+        if (gfx_upscale_texture(st, s)) {
+            tex_scale[s * 4 + 2] = static_cast<float>(st.tex[s]->width);
+            tex_scale[s * 4 + 3] = static_cast<float>(st.tex[s]->height);
+        }
     }
 
     if (st.is_programmable_ps) {
@@ -1167,7 +1209,7 @@ void d3d11_present() {
         g_ctx->OMSetRenderTargets(1, &g_back_rtv, nullptr);
         g_ctx->OMSetDepthStencilState(get_ds_state(false, false, 8, false, 8, 1, 1, 1, 0xFF, 0xFF), 0);
         g_ctx->OMSetBlendState(get_blend_state(false, 2, 1, 1, 0xF), nullptr, 0xFFFFFFFF);
-        g_ctx->RSSetState(get_rs_state(1, 3));
+        g_ctx->RSSetState(get_rs_state(1, 3, false, 0.0f, 0.0f));
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(g_ctx->Map(g_quad_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             std::memcpy(m.pData, fsq, sizeof(fsq));

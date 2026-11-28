@@ -30,12 +30,17 @@ std::mutex g_gl_owner_mtx;
 
 void ensure_gl_current() {
     if (!g_gl_ctx || !g_sdl_win) return;
-    auto tid = std::this_thread::get_id();
-    if (g_gl_owner_tid == tid) return;
+    if (SDL_GL_GetCurrentContext() == g_gl_ctx) return;
     std::lock_guard<std::mutex> lk(g_gl_owner_mtx);
-    if (g_gl_owner_tid != tid) {
-        SDL_GL_MakeCurrent(g_sdl_win, g_gl_ctx);
-        g_gl_owner_tid = tid;
+    if (SDL_GL_GetCurrentContext() != g_gl_ctx) {
+        if (SDL_GL_MakeCurrent(g_sdl_win, g_gl_ctx) == 0) {
+            g_gl_owner_tid = std::this_thread::get_id();
+        } else {
+            static int s_err_logs = 0;
+            if (s_err_logs++ < 8) {
+                hle_log_note("[GFX-GL] SDL_GL_MakeCurrent failed: %s", SDL_GetError());
+            }
+        }
     }
 }
 
@@ -173,9 +178,11 @@ GLint gl_wrap(uint32_t a) {
     }
 }
 
-GLuint get_sampler(uint32_t au, uint32_t av, uint32_t minf, uint32_t magf) {
+GLuint get_sampler(uint32_t au, uint32_t av, uint32_t minf, uint32_t magf, bool upscale) {
     auto& gl = whacked_gl();
-    uint64_t k = uint64_t(au) | (uint64_t(av) << 4) | (uint64_t(minf) << 8) | (uint64_t(magf) << 12) | (g_cfg.aniso_16x ? 0x10000ull : 0ull);
+    const bool aniso = g_cfg.aniso_16x && !upscale;
+    uint64_t k = uint64_t(au) | (uint64_t(av) << 4) | (uint64_t(minf) << 8) | (uint64_t(magf) << 12) |
+                 (aniso ? 0x10000ull : 0ull) | (upscale ? 0x20000ull : 0ull);
     auto it = g_samp_cache.find(k);
     if (it != g_samp_cache.end()) return it->second;
 
@@ -184,10 +191,10 @@ GLuint get_sampler(uint32_t au, uint32_t av, uint32_t minf, uint32_t magf) {
     gl.glSamplerParameteri(s, GL_TEXTURE_WRAP_S, gl_wrap(au));
     gl.glSamplerParameteri(s, GL_TEXTURE_WRAP_T, gl_wrap(av));
     gl.glSamplerParameteri(s, GL_TEXTURE_WRAP_R, GL_REPEAT);
-    bool point = (minf <= 1 && magf <= 1);
+    bool point = !upscale && minf <= 1 && magf <= 1;
     gl.glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, point ? GL_NEAREST : GL_LINEAR_MIPMAP_LINEAR);
     gl.glSamplerParameteri(s, GL_TEXTURE_MAG_FILTER, point ? GL_NEAREST : GL_LINEAR);
-    if (g_cfg.aniso_16x && !point && gl.has_aniso) {
+    if (aniso && !point && gl.has_aniso) {
         GLfloat maxa = 1.0f;
         glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxa);
         gl.glSamplerParameterf(s, GL_TEXTURE_MAX_ANISOTROPY_EXT, std::min(16.0f, maxa));
@@ -502,14 +509,20 @@ void set_vertex_attrib_from_decl(const Nv2aVertexDecl::Element& e, uint32_t stri
         case 0x22: gl.glVertexAttribPointer(e.reg, 2, GL_FLOAT, GL_FALSE, stride, ptr); break;
         case 0x32: gl.glVertexAttribPointer(e.reg, 3, GL_FLOAT, GL_FALSE, stride, ptr); break;
         case 0x42: gl.glVertexAttribPointer(e.reg, 4, GL_FLOAT, GL_FALSE, stride, ptr); break;
+        case 0x72: gl.glVertexAttribPointer(e.reg, 3, GL_FLOAT, GL_FALSE, stride, ptr); break;
         case 0x40: gl.glVertexAttribPointer(e.reg, GL_BGRA, GL_UNSIGNED_BYTE, GL_TRUE, stride, ptr); break;
-        case 0x41: gl.glVertexAttribIPointer(e.reg, 4, GL_UNSIGNED_BYTE, stride, ptr); break;
-        case 0x11: gl.glVertexAttribPointer(e.reg, 1, GL_SHORT, GL_FALSE, stride, ptr); break;
-        case 0x21: gl.glVertexAttribPointer(e.reg, 2, GL_SHORT, GL_FALSE, stride, ptr); break;
-        case 0x45: gl.glVertexAttribPointer(e.reg, 4, GL_SHORT, GL_TRUE, stride, ptr); break;
+        case 0x11: gl.glVertexAttribIPointer(e.reg, 1, GL_SHORT, stride, ptr); break;
+        case 0x21: gl.glVertexAttribIPointer(e.reg, 2, GL_SHORT, stride, ptr); break;
+        case 0x31: gl.glVertexAttribIPointer(e.reg, 3, GL_SHORT, stride, ptr); break;
+        case 0x41: gl.glVertexAttribIPointer(e.reg, 4, GL_SHORT, stride, ptr); break;
+        case 0x15: gl.glVertexAttribPointer(e.reg, 1, GL_SHORT, GL_TRUE, stride, ptr); break;
         case 0x25: gl.glVertexAttribPointer(e.reg, 2, GL_SHORT, GL_TRUE, stride, ptr); break;
-        case 0x44: gl.glVertexAttribPointer(e.reg, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, ptr); break;
+        case 0x35: gl.glVertexAttribPointer(e.reg, 3, GL_SHORT, GL_TRUE, stride, ptr); break;
+        case 0x45: gl.glVertexAttribPointer(e.reg, 4, GL_SHORT, GL_TRUE, stride, ptr); break;
+        case 0x14: gl.glVertexAttribPointer(e.reg, 1, GL_UNSIGNED_BYTE, GL_TRUE, stride, ptr); break;
+        case 0x24: gl.glVertexAttribPointer(e.reg, 2, GL_UNSIGNED_BYTE, GL_TRUE, stride, ptr); break;
         case 0x34: gl.glVertexAttribPointer(e.reg, 3, GL_UNSIGNED_BYTE, GL_TRUE, stride, ptr); break;
+        case 0x44: gl.glVertexAttribPointer(e.reg, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, ptr); break;
         case 0x16: gl.glVertexAttribIPointer(e.reg, 1, GL_UNSIGNED_INT, stride, ptr); break;
         default:   gl.glVertexAttribPointer(e.reg, 4, GL_FLOAT, GL_FALSE, stride, ptr); break;
     }
@@ -542,6 +555,13 @@ bool gl_init(void* sdl_win, const RendererSettings& settings) {
                  reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
                  reinterpret_cast<const char*>(glGetString(GL_VERSION)));
 
+    if (settings.backend == GfxBackendKind::Vulkan) {
+        const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        if (!renderer || std::string(renderer).find("zink") == std::string::npos) {
+            hle_log_note("[GFX] Vulkan requires the Mesa Zink driver.");
+            return false;
+        }
+    }
     create_targets(g_cfg.width, g_cfg.height);
     nv2a_shaders_init(nullptr, true, g_cfg.cache_dir);
     init_quad_and_white();
@@ -560,14 +580,18 @@ bool gl_init(void* sdl_win, const RendererSettings& settings) {
     mk_ubo(g_ubo_ps,      352);
     gl.glBindBuffer(GL_UNIFORM_BUFFER, 0);
 
-    ui_set_active_backend_name("OpenGL 3.3 Core (Cross-Platform)");
+    ui_set_active_backend_name(settings.backend == GfxBackendKind::Vulkan ? "Vulkan (Mesa Zink)" : "OpenGL 3.3 Core (Cross-Platform)");
     ui_init_gl3(sdl_win, g_gl_ctx);
     g_gl_owner_tid = std::this_thread::get_id();
     return true;
 }
 
+void gl_ensure_current() {
+    ensure_gl_current();
+}
+
 void gl_release_context() {
-    if (g_sdl_win && g_gl_ctx) {
+    if (g_sdl_win && g_gl_ctx && SDL_GL_GetCurrentContext() == g_gl_ctx) {
         std::lock_guard<std::mutex> lk(g_gl_owner_mtx);
         SDL_GL_MakeCurrent(g_sdl_win, nullptr);
         g_gl_owner_tid = {};
@@ -606,12 +630,11 @@ void gl_shutdown() {
 
 void gl_resize(int width, int height) {
     if (!g_gl_ctx || width <= 0 || height <= 0) return;
-    if (g_gl_owner_tid != std::thread::id{} && g_gl_owner_tid != std::this_thread::get_id()) {
+    if (SDL_GL_GetCurrentContext() != g_gl_ctx) {
         g_pending_resize_w.store(width);
         g_pending_resize_h.store(height);
         return;
     }
-    ensure_gl_current();
     create_targets(width, height);
 }
 
@@ -766,6 +789,12 @@ void gl_draw(const DrawStateSnapshot& st) {
     }
 
     glPolygonMode(GL_FRONT_AND_BACK, (st.fill_mode == 2) ? GL_LINE : GL_FILL);
+    if (st.poly_offset_fill) {
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(st.poly_offset_scale, st.poly_offset_bias);
+    } else {
+        glDisable(GL_POLYGON_OFFSET_FILL);
+    }
     if (st.cull_mode == 1) {
         glDisable(GL_CULL_FACE);
     } else {
@@ -789,7 +818,7 @@ void gl_draw(const DrawStateSnapshot& st) {
         } else {
             glBindTexture(expect_cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, expect_cube ? 0u : g_white_tex);
         }
-        gl.glBindSampler(s, get_sampler(st.addr_u[s], st.addr_v[s], st.min_filter[s], st.mag_filter[s]));
+        gl.glBindSampler(s, get_sampler(st.addr_u[s], st.addr_v[s], st.min_filter[s], st.mag_filter[s], gfx_upscale_texture(st, s)));
     }
 
     GfxTransformParams tp = gfx_compute_transform_params(st, static_cast<float>(rt_w), static_cast<float>(rt_h),
@@ -844,7 +873,10 @@ void gl_draw(const DrawStateSnapshot& st) {
         } else {
             tex_scale[s * 4 + 0] = 1.0f; tex_scale[s * 4 + 1] = 1.0f;
         }
-        tex_scale[s * 4 + 2] = 1.0f; tex_scale[s * 4 + 3] = 1.0f;
+        if (gfx_upscale_texture(st, s)) {
+            tex_scale[s * 4 + 2] = static_cast<float>(st.tex[s]->width);
+            tex_scale[s * 4 + 3] = static_cast<float>(st.tex[s]->height);
+        }
     }
 
     gl.glBindBuffer(GL_UNIFORM_BUFFER, g_ubo_ps);

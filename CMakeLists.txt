@@ -184,6 +184,23 @@ else()
     )
 endif()
 
+if(WIN32)
+    set(dxvk_archive "${CMAKE_BINARY_DIR}/dxvk-2.7.1.tar.gz")
+    set(dxvk_hash "d85ce7c79f57ecd765aaa1b9e7007cb875e6fde9f6d331df799bce73d513ce87")
+    if(NOT EXISTS "${dxvk_archive}")
+        file(DOWNLOAD "https://github.com/doitsujin/dxvk/releases/download/v2.7.1/dxvk-2.7.1.tar.gz"
+             "${dxvk_archive}" EXPECTED_HASH SHA256=${dxvk_hash})
+    endif()
+    file(SHA256 "${dxvk_archive}" actual_dxvk_hash)
+    if(NOT actual_dxvk_hash STREQUAL dxvk_hash)
+        message(FATAL_ERROR "DXVK archive checksum mismatch")
+    endif()
+    file(ARCHIVE_EXTRACT INPUT "${dxvk_archive}" DESTINATION "${CMAKE_BINARY_DIR}/_deps"
+         PATTERNS "dxvk-2.7.1/x64/d3d11.dll" "dxvk-2.7.1/x64/dxgi.dll")
+    add_custom_command(TARGET WhackedRecomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/_deps/dxvk-2.7.1/x64" "$<TARGET_FILE_DIR:WhackedRecomp>/dxvk")
+endif()
+
 enable_testing()
 add_executable(whacked_tests
     tests/whacked_tests.cpp

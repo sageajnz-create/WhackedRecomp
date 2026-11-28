@@ -157,11 +157,12 @@
       "id": "renderer",
       "label": "Graphics API",
       "group": "Graphics",
-      "help": "Direct3D 11 (Windows default) or OpenGL 3.3 Core (Linux & Windows fallback).",
+      "help": "Direct3D 11 (Windows default), OpenGL 3.3 Core, or Vulkan via DXVK on Windows and Mesa Zink on Linux.",
       "choices": [
         { "label": "Auto (D3D11 / OpenGL)", "set": { "Graphics/renderer": "auto" } },
         { "label": "Direct3D 11 (Windows)", "set": { "Graphics/renderer": "d3d11" } },
-        { "label": "OpenGL 3.3 Core",       "set": { "Graphics/renderer": "opengl" } }
+        { "label": "OpenGL 3.3 Core",       "set": { "Graphics/renderer": "opengl" } },
+        { "label": "Vulkan (DXVK / Mesa Zink)", "set": { "Graphics/renderer": "vulkan" } }
       ],
       "defaults": { "Graphics/renderer": "auto" }
     },

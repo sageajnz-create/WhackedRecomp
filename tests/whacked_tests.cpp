@@ -7,6 +7,8 @@
 #include "rl_achievements.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +16,7 @@
 #include <filesystem>
 #include <initializer_list>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -24,6 +27,14 @@ int16_t test_audio_mix_sample(unsigned effects, bool music);
 int32_t test_audio_get_buffer_volume(uint32_t obj_va, bool* out_found);
 int32_t test_audio_get_stream_volume(uint32_t obj_va, bool* out_found);
 void test_audio_clear_objects();
+uint64_t test_audio_get_bink_queued_frames(uint32_t stream_id);
+void test_audio_pump_frames(int frames);
+uint32_t audio_bink_open_stream(uint32_t sample_rate, uint32_t channels);
+void audio_bink_push_pcm(uint32_t stream_id, const int16_t* samples, size_t byte_len);
+void audio_bink_pause(uint32_t stream_id, bool paused);
+void audio_bink_flush(uint32_t stream_id);
+double audio_bink_get_clock_sec(uint32_t stream_id);
+void audio_bink_close(uint32_t stream_id);
 std::string test_kernel_resolve_attrs(uint32_t obj_attr_va);
 void test_kernel_io_create_symlink(CpuContext& ctx);
 void test_kernel_io_delete_symlink(CpuContext& ctx);
@@ -39,6 +50,7 @@ extern void audio_shutdown();
 bool ui_is_launcher_active() { return false; }
 bool ui_is_overlay_open() { return false; }
 bool ui_wants_keyboard() { return false; }
+bool ui_quit_prompt_captures_input() { return false; }
 void ui_toggle_overlay() {}
 
 namespace {
@@ -431,6 +443,11 @@ void test_net_room_code_crc8() {
     CHECK(net_decode_room_code(code, ip, port) && ip == "203.0.113.42" && port == 30740,
           "decode recovers exact IPv4 + UDP port");
 
+    CHECK(net_decode_room_code("\r\n  " + code + "\r\n", ip, port) && port == 30740,
+          "room codes pasted with line endings decode");
+    CHECK(!net_decode_room_code("127.0.0.1:30740junk", ip, port), "trailing port garbage rejected");
+    CHECK(!net_decode_room_code("127.0.0.1:", ip, port), "missing port rejected");
+
     // Flip last character -> CRC8 must reject
     std::string bad = code;
     bad.back() = (bad.back() == 'A') ? 'B' : 'A';
@@ -461,6 +478,84 @@ void test_rl_achievements_rules() {
     rl_ach_shutdown();
 }
 
+void test_bink_audio_backpressure_and_clock() {
+    uint32_t sid = audio_bink_open_stream(44100u, 2u);
+    CHECK(sid != 0, "audio_bink_open_stream returns non-zero id");
+    audio_bink_pause(sid, true);
+
+    std::vector<int16_t> chunk(1024u * 2u, 1000);
+    std::atomic<int> pushed{0};
+    std::atomic<bool> done{false};
+    std::thread prod([&]() {
+        for (int i = 0; i < 64; ++i) {
+            audio_bink_push_pcm(sid, chunk.data(), chunk.size() * sizeof(int16_t));
+            pushed.fetch_add(1, std::memory_order_release);
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    // Wait briefly until queue hits the 1s cap (~44,100 frames = 44 chunks of 1024)
+    auto t0 = std::chrono::steady_clock::now();
+    while (pushed.load(std::memory_order_acquire) < 44 &&
+           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() < 1500) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    int blocked_count = pushed.load(std::memory_order_acquire);
+    CHECK(blocked_count >= 43 && blocked_count < 64 && !done.load(std::memory_order_acquire),
+          "audio_bink_push_pcm applies backpressure instead of silently dropping chunks");
+    test_audio_pump_frames(4096);
+    CHECK(std::abs(audio_bink_get_clock_sec(sid)) < 1e-6,
+          "paused Bink audio stream does not advance audio clock during mix");
+
+    // Unpause and pump until all 64 chunks complete without loss
+    audio_bink_pause(sid, false);
+    t0 = std::chrono::steady_clock::now();
+    while (!done.load(std::memory_order_acquire) &&
+           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() < 3000) {
+        test_audio_pump_frames(4096);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (!done.load(std::memory_order_acquire)) audio_bink_close(sid);
+    prod.join();
+    CHECK(done.load(std::memory_order_acquire) && pushed.load(std::memory_order_acquire) == 64,
+          "unpausing drains queued Bink chunks cleanly without drops");
+    double clk = audio_bink_get_clock_sec(sid);
+    CHECK(clk > 0.2, "Bink audio clock advances monotonically as frames are consumed");
+    audio_bink_flush(sid);
+    CHECK(test_audio_get_bink_queued_frames(sid) == 0 && std::abs(audio_bink_get_clock_sec(sid)) < 1e-6,
+          "audio_bink_flush clears queued frames and resets audio clock");
+
+    // Closing a stream must immediately unblock a waiting producer thread
+    audio_bink_pause(sid, true);
+    std::atomic<bool> closed_done{false};
+    std::thread blocked_prod([&]() {
+        for (int i = 0; i < 64; ++i) {
+            audio_bink_push_pcm(sid, chunk.data(), chunk.size() * sizeof(int16_t));
+        }
+        closed_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    audio_bink_close(sid);
+    blocked_prod.join();
+    CHECK(closed_done.load(std::memory_order_acquire),
+          "audio_bink_close unblocks saturated producer thread immediately");
+}
+
+void test_kernel_shutdown_and_wait() {
+    CHECK(xbox_mem_init(), "xbox_mem_init succeeds for kernel shutdown test");
+    hle_register_kernel();
+    CHECK(!hle_kernel_is_shutting_down(), "hle_register_kernel resets shutdown state");
+    CHECK(hle_kernel_wait_for_guest_threads(50), "no stray guest threads before spawn");
+    hle_kernel_request_shutdown();
+    CHECK(hle_kernel_is_shutting_down(), "hle_kernel_request_shutdown flips shutdown flag");
+    hle_kernel_shutdown();
+    hle_register_kernel();
+    CHECK(!hle_kernel_is_shutting_down(), "hle_register_kernel re-arms after shutdown");
+    hle_kernel_shutdown();
+    xbox_mem_shutdown();
+}
+
 } // namespace
 
 int main() {
@@ -472,7 +567,9 @@ int main() {
     test_audio_mix_bin_routing();
     test_audio_thunk_dispatch_and_volumes();
     test_audio_mixer_controls();
+    test_bink_audio_backpressure_and_clock();
     test_kernel_symlinks_and_file_ops();
+    test_kernel_shutdown_and_wait();
     test_net_room_code_crc8();
     test_rl_achievements_rules();
 
