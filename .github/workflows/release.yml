@@ -9,13 +9,36 @@ on:
       tag:
         description: 'Release version tag (e.g. v1.0.0)'
         required: true
-        default: 'v1.0.0'
+        type: string
+      publish:
+        description: 'Publish this release after both packages are ready'
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
 
 jobs:
+  validate-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches the application version
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Expected a release tag in vMAJOR.MINOR.PATCH format."
+            exit 1
+          fi
+          if ! grep -Fxq "constexpr const char* kAppVersion = \"${RELEASE_TAG#v}\";" src/main.cpp; then
+            echo "::error::Release tag does not match the application version."
+            exit 1
+          fi
+
   build-windows:
+    needs: validate-release
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +51,7 @@ jobs:
       - name: Package Windows ZIP
         shell: pwsh
         run: |
-          $tag = if ("${{ github.ref_name }}" -like "v*") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
+          $tag = $env:RELEASE_TAG
           $stage = "stage_win/WhackedRecomp"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item build/WhackedRecomp.exe $stage/
@@ -42,9 +65,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows
+          if-no-files-found: error
           path: WhackedRecomp-*-Windows-x64.zip
 
   build-linux:
+    needs: validate-release
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -59,8 +84,7 @@ jobs:
           ctest --test-dir build_linux --output-on-failure
       - name: Package Portable Linux Folder as AppImage & Tarball
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [[ "$TAG" != v* ]]; then TAG="${{ inputs.tag }}"; fi
+          TAG="$RELEASE_TAG"
 
           mkdir -p AppDir/usr/bin AppDir/assets AppDir/third_party/rl_achievements AppDir/usr/share/icons/hicolor/512x512/apps AppDir/usr/share/icons/hicolor/scalable/apps
           cp build_linux/WhackedRecomp AppDir/usr/bin/WhackedRecomp
@@ -107,24 +131,33 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: release-linux
+          if-no-files-found: error
           path: |
             WhackedRecomp-*-Linux-x64.tar.gz
             WhackedRecomp-*-Linux-x64.AppImage
 
   publish-release:
     needs: [build-windows, build-linux]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref_type == 'tag' || (github.ref == 'refs/heads/main' && inputs.publish)
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
       - name: Generate SHA-256 checksums
-        run: sha256sum WhackedRecomp-* > SHA256SUMS.txt
+        run: |
+          sha256sum "WhackedRecomp-${RELEASE_TAG}-Windows-x64.zip" \
+            "WhackedRecomp-${RELEASE_TAG}-Linux-x64.tar.gz" \
+            "WhackedRecomp-${RELEASE_TAG}-Linux-x64.AppImage" > SHA256SUMS.txt
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             WhackedRecomp-*
             SHA256SUMS.txt
