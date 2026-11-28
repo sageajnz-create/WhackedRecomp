@@ -50,7 +50,7 @@ extern void hle_input_poll_ui_snapshot();
 
 namespace {
 
-constexpr const char* kAppVersion = "1.0.3";
+constexpr const char* kAppVersion = "1.0.4";
 
 SDL_Window* g_sdl_win = nullptr;
 std::atomic<bool> g_quit_requested{false};
@@ -199,7 +199,7 @@ void print_help() {
         "  --version, -v              Print version information\n"
         "  --help, -h                 Show this help message\n\n"
         "Graphics & Display:\n"
-        "  --renderer <api>           auto | d3d11 (Windows) | opengl\n"
+        "  --renderer <api>           auto | d3d11 (Windows) | opengl | vulkan\n"
         "  --width <px> --height <px> Window resolution (e.g. 1280 720, 1920 1080)\n"
         "  --fullscreen <0|1>         Windowed or desktop fullscreen\n"
         "  --widescreen <0|1>         True 16:9 Hor+ widescreen (default: 1)\n"
@@ -275,6 +275,7 @@ void posix_crash_handler(int sig) {
 void pump_sdl_events() {
     SDL_Event ev{};
     while (SDL_PollEvent(&ev)) {
+        const bool quit_shortcut = ui_handle_quit_shortcut(&ev);
         ui_process_sdl_event(&ev);
         if (ev.type == SDL_QUIT) {
             g_quit_requested.store(true);
@@ -301,7 +302,8 @@ void pump_sdl_events() {
         } else if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
             if (ev.key.keysym.scancode == SDL_SCANCODE_RETURN && (ev.key.keysym.mod & KMOD_ALT)) {
                 toggle_fullscreen_window();
-            } else if (ev.key.keysym.scancode == SDL_SCANCODE_ESCAPE && g_fullscreen_state && !ui_is_overlay_open() && !ui_is_launcher_active()) {
+            } else if (!quit_shortcut && ev.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
+                       g_fullscreen_state && !ui_is_overlay_open() && !ui_is_launcher_active()) {
                 toggle_fullscreen_window();
             }
         }
@@ -507,6 +509,12 @@ int app_main(int argc, char** argv) {
         if (auto fn = reinterpret_cast<XInitThreadsFn>(::dlsym(x11, "XInitThreads"))) fn();
     }
 #endif
+#ifndef _WIN32
+    if (cfg.renderer == "vulkan") {
+        SDL_setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
+        SDL_setenv("GALLIUM_DRIVER", "zink", 1);
+    }
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC | SDL_INIT_TIMER) != 0) {
         std::fprintf(stderr, "[FATAL] SDL_Init failed: %s\n", SDL_GetError());
         log_note("[FATAL] SDL_Init failed: %s", SDL_GetError());
@@ -544,6 +552,9 @@ int app_main(int argc, char** argv) {
         return 1;
     }
 
+    if (!cfg.fullscreen) fit_window_to_display(g_sdl_win, cfg.width, cfg.height);
+    SDL_GetWindowSize(g_sdl_win, &cfg.width, &cfg.height);
+
     // RecompLauncher-compatible cache path ({data}/cache/shaders), migrating legacy shader_cache if present
     fs::path new_cache = fs::path(userdata_root) / "cache" / "shaders";
     fs::path old_cache = fs::path(userdata_root) / "shader_cache";
@@ -562,7 +573,7 @@ int app_main(int argc, char** argv) {
     rcfg.vsync           = cfg.vsync;
     rcfg.fps_cap         = cfg.fps_cap;
     rcfg.show_fps        = cfg.show_fps;
-    rcfg.backend         = use_gl ? GfxBackendKind::OpenGL : GfxBackendKind::D3D11;
+    rcfg.backend         = cfg.renderer == "vulkan" ? GfxBackendKind::Vulkan : (use_gl ? GfxBackendKind::OpenGL : GfxBackendKind::D3D11);
     rcfg.screenshot_dir  = g_shot_out_dir;
     rcfg.cache_dir       = chosen_cache;
 
@@ -575,7 +586,6 @@ int app_main(int argc, char** argv) {
     }
 
     ui_set_userdata_root(userdata_root);
-    ui_set_iso_status(iso_path, iso_ok, probe.message);
     audio_set_mix_levels(cfg.master_volume, cfg.sfx_volume, cfg.music_volume, cfg.muted);
 
     if (cli_host_port > 0) {
@@ -594,6 +604,8 @@ int app_main(int argc, char** argv) {
         net_start_offline_lan(cfg.player_name);
     }
 
+    ui_set_iso_status(iso_path, iso_ok, probe.message);
+
     bool show_launcher = !headless_run || !g_shot_launcher_path.empty();
     if (show_launcher) {
         ui_set_launcher_active(true);
@@ -605,6 +617,7 @@ int app_main(int argc, char** argv) {
                 if (lframe == 8) gfx_request_screenshot(g_shot_launcher_path);
                 else if (lframe >= 10) {
                     gfx_shutdown();
+                    ui_finish_network_setup();
                     net_shutdown();
                     audio_shutdown();
                     XisoVfs::instance().unmount();
@@ -625,6 +638,7 @@ int app_main(int argc, char** argv) {
 
     if (g_quit_requested.load()) {
         gfx_shutdown();
+        ui_finish_network_setup();
         net_shutdown();
         audio_shutdown();
         XisoVfs::instance().unmount();
@@ -638,6 +652,7 @@ int app_main(int argc, char** argv) {
         std::fprintf(stderr, "[FATAL] default.xbe not found inside game source\n");
         log_note("[FATAL] default.xbe missing inside game source");
         gfx_shutdown();
+        ui_finish_network_setup();
         net_shutdown();
         return 2;
     }
@@ -646,6 +661,7 @@ int app_main(int argc, char** argv) {
         std::fprintf(stderr, "[FATAL] TitleID 0x%08X does not match Whacked! (0x4D530027)\n", g_xbe_info.title_id);
         log_note("[FATAL] Wrong TitleID 0x%08X", g_xbe_info.title_id);
         gfx_shutdown();
+        ui_finish_network_setup();
         net_shutdown();
         return 3;
     }
@@ -658,6 +674,7 @@ int app_main(int argc, char** argv) {
     }
 
     recomp_register_all();
+    hle_set_thread_exit_hook(gfx_release_context_for_game);
     gfx_release_context_for_game();
 
     rl_ach_set_info("whackedrecomp", kAppVersion);
@@ -700,9 +717,11 @@ int app_main(int argc, char** argv) {
         try {
             recomp_dispatch_call(ctx, g_xbe_info.entry_va);
         } catch (const GuestPowerOff&) {
+            gfx_release_context_for_game();
             app_request_quit();
             return;
         }
+        gfx_release_context_for_game();
         std::printf("[BOOT] XbeEntry returned cleanly (main game thread spawned).\n");
     });
 
@@ -732,11 +751,17 @@ int app_main(int argc, char** argv) {
         app_config_save(userdata_root);
     }
     log_note("[BOOT] Shutting down");
-    if (entry_thr.joinable()) entry_thr.detach();
+    hle_kernel_request_shutdown();
     hle_bink_shutdown();
+    if (entry_thr.joinable()) entry_thr.join();
+    if (!hle_kernel_wait_for_guest_threads(2000)) {
+        log_note("[BOOT] Warning: guest threads still active after 2000ms shutdown wait");
+    }
+    hle_input_shutdown();
     rl_ach_shutdown();
     audio_shutdown();
     hle_kernel_shutdown();
+    ui_finish_network_setup();
     net_shutdown();
     gfx_shutdown();
     XisoVfs::instance().unmount();

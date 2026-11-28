@@ -24,6 +24,7 @@ extern void gl_shutdown();
 extern void gl_resize(int width, int height);
 extern void gl_set_fullscreen(bool fs);
 extern void gl_release_context();
+extern void gl_ensure_current();
 extern RendererSettings& gl_settings();
 extern double gl_get_fps();
 extern int gl_get_last_draw_calls();
@@ -113,6 +114,10 @@ void gfx_set_fullscreen(bool fs) {
 
 void gfx_release_context_for_game() {
     if (g_active_is_gl) gl_release_context();
+}
+
+void gfx_ensure_gl_current() {
+    if (g_active_is_gl && !g_shutting_down.load(std::memory_order_acquire)) gl_ensure_current();
 }
 
 bool gfx_is_opengl() {
@@ -207,6 +212,14 @@ void gfx_retire_buffer(uint32_t obj_va) {
     if (!g_active_is_gl) { d3d11_retire_buffer(obj_va); return; }
 #endif
     gl_retire_buffer(obj_va);
+}
+
+bool gfx_upscale_texture(const DrawStateSnapshot& st, int stage) {
+    const auto* texture = st.tex[stage];
+    return texture && texture->width > 1 && texture->height > 1 &&
+           !texture->is_cube && !texture->is_volume &&
+           (texture->is_bink_frame ||
+            (!st.custom_rt && st.vs && st.vs->is_screenspace && !texture->is_render_target));
 }
 
 GfxTransformParams gfx_compute_transform_params(const DrawStateSnapshot& st, float rt_w, float rt_h,

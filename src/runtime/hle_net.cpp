@@ -157,6 +157,7 @@ std::atomic<bool> g_tunnel_stop{false};
 std::atomic<bool> g_tunnel_running{false};
 bool g_tunnel_connected = false;
 bool g_upnp_ok = false;
+uint64_t g_connect_started_ms = 0;
 uint8_t g_self_id = 17;
 uint16_t g_host_tunnel_port = 30740;
 std::string g_player_name = "Player1";
@@ -373,7 +374,7 @@ void parse_stun_response(const uint8_t* buf, int len) {
             g_public_ip = pub;
             if (g_lobby_mode == NetLobbyMode::HostRoom) {
                 std::string code;
-                if (net_encode_room_code(pub, xport ? xport : g_host_tunnel_port, code)) {
+                if (net_encode_room_code(pub, g_upnp_ok ? g_host_tunnel_port : (xport ? xport : g_host_tunnel_port), code)) {
                     g_room_code = code;
                 }
             }
@@ -515,6 +516,7 @@ void try_upnp_mapping_thread(uint16_t port, std::string lan_ip) {
     if (map_res.find("200 OK") != std::string::npos) {
         std::lock_guard<std::mutex> lk(g_net_mtx);
         g_upnp_ok = true;
+        if (!g_public_ip.empty()) net_encode_room_code(g_public_ip, g_host_tunnel_port, g_room_code);
     }
 }
 
@@ -523,6 +525,7 @@ void tunnel_worker_loop() {
     uint64_t last_roster_ms = 0;
     uint64_t last_hello_ms = 0;
     bool stun_sent = false;
+    uint64_t last_host_seen_ms = now_ms();
 
     uint8_t buf[8192];
     while (!g_tunnel_stop.load()) {
@@ -553,12 +556,19 @@ void tunnel_worker_loop() {
                     continue;
                 }
 
+                if (g_lobby_mode == NetLobbyMode::JoinRoom &&
+                    (from.sin_addr.s_addr != g_join_host_ep.sin_addr.s_addr || from.sin_port != g_join_host_ep.sin_port))
+                    continue;
                 if (n < 6) continue;
                 uint32_t magic = 0;
                 std::memcpy(&magic, buf, 4);
                 if (magic != kTunnelMagic) continue;
                 uint8_t msg_type = buf[4];
                 uint8_t sender_id = buf[5];
+                if (g_lobby_mode == NetLobbyMode::JoinRoom &&
+                    (msg_type == MSG_WELCOME || msg_type == MSG_KEEPALIVE || msg_type == MSG_PEERLIST || msg_type == MSG_DATA)) {
+                    last_host_seen_ms = now_ms();
+                }
 
                 if (msg_type == MSG_DATA && n >= 20) {
                     uint32_t src_ip = 0, dst_ip = 0;
@@ -644,7 +654,7 @@ void tunnel_worker_loop() {
                         std::lock_guard<std::mutex> lk(g_net_mtx);
                         g_self_id = my_id;
                         g_tunnel_connected = true;
-                        g_status_text = "Connected (" + ip_nbo_to_str(make_virtual_ip_nbo(my_id)) + ")";
+                        g_status_text = "Connected to your friend";
                         rebuild_roster_locked();
                     }
                 } else if (msg_type == MSG_KEEPALIVE && n >= 16) {
@@ -705,6 +715,18 @@ void tunnel_worker_loop() {
 
         uint64_t t = now_ms();
         if (g_lobby_mode == NetLobbyMode::JoinRoom) {
+            {
+                std::lock_guard<std::mutex> lk(g_net_mtx);
+                if (g_tunnel_connected && t - last_host_seen_ms > 10000) {
+                    g_tunnel_connected = false;
+                    g_connect_started_ms = t;
+                    rebuild_roster_locked();
+                }
+                if (!g_tunnel_connected && t - g_connect_started_ms >= 12000)
+                    g_status_text = "Host has not replied. Check the code and ask your friend to keep their room open.";
+                else if (!g_tunnel_connected)
+                    g_status_text = "Connecting to your friend...";
+            }
             if (!g_tunnel_connected && t - last_hello_ms >= 350) {
                 last_hello_ms = t;
                 uint8_t hello[40]{};
@@ -1514,14 +1536,14 @@ bool net_decode_room_code(const std::string& code_or_addr, std::string& out_ip, 
     ensure_wsa();
     std::string s = code_or_addr;
     // Trim whitespace
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.pop_back();
     if (s.empty()) return false;
 
     // Check WHK-XXXX-XXXX-XXXX form (or 12-char Base32 code)
     std::string upper;
     for (char c : s) {
-        if (c != '-' && c != ' ') upper.push_back(static_cast<char>(c >= 'a' && c <= 'z' ? (c - 'a' + 'A') : c));
+        if (c != '-' && c != ' ' && c != '\r' && c != '\n' && c != '\t') upper.push_back(static_cast<char>(c >= 'a' && c <= 'z' ? (c - 'a' + 'A') : c));
     }
     if (upper.rfind("WHK", 0) == 0 && upper.size() == 15) upper = upper.substr(3);
     if (upper.size() == 12) {
@@ -1552,13 +1574,18 @@ bool net_decode_room_code(const std::string& code_or_addr, std::string& out_ip, 
         }
     }
 
+    if (upper.rfind("WHK", 0) == 0) return false;
+
     // Parse host[:port]
     std::string host = s;
     uint16_t port = 30740;
     size_t colon = s.rfind(':');
     if (colon != std::string::npos) {
         host = s.substr(0, colon);
-        int p = std::atoi(s.substr(colon + 1).c_str());
+        const std::string digits = s.substr(colon + 1);
+        if (digits.empty() || digits.size() > 5 || digits.find_first_not_of("0123456789") != std::string::npos)
+            return false;
+        int p = std::atoi(digits.c_str());
         if (p <= 0 || p > 65535) return false;
         port = static_cast<uint16_t>(p);
     }
@@ -1672,6 +1699,7 @@ bool net_start_host(uint16_t tunnel_port, bool try_upnp, const std::string& play
     {
         std::lock_guard<std::mutex> lk(g_net_mtx);
         g_lobby_mode = NetLobbyMode::HostRoom;
+        g_connect_started_ms = now_ms();
         g_self_id = 1;
         g_host_tunnel_port = tunnel_port;
         g_player_name = player_name.empty() ? "Host" : player_name;
@@ -1698,18 +1726,17 @@ bool net_start_host(uint16_t tunnel_port, bool try_upnp, const std::string& play
 }
 
 bool net_join_room(const std::string& room_code_or_addr, const std::string& player_name) {
-    stop_worker_threads();
     ensure_wsa();
 
     std::string host_ip;
     uint16_t host_port = 0;
     if (!net_decode_room_code(room_code_or_addr, host_ip, host_port)) {
         std::lock_guard<std::mutex> lk(g_net_mtx);
-        g_lobby_mode = NetLobbyMode::OfflineOrLan;
-        g_status_text = "Invalid room code or IP:Port";
+        g_status_text = "That room code is invalid. Ask your friend to copy it again.";
         return false;
     }
 
+    stop_worker_threads();
     NativeSock s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == kInvalidSock) return false;
     sockaddr_in bind_sa{};
@@ -1733,6 +1760,7 @@ bool net_join_room(const std::string& room_code_or_addr, const std::string& play
         g_public_ip.clear();
         g_upnp_ok = false;
         g_tunnel_connected = false;
+        g_connect_started_ms = now_ms();
         g_host_peers.clear();
         g_room_code = canonical_code;
         g_host_endpoint_str = host_ip + ":" + std::to_string(host_port);
@@ -1771,6 +1799,9 @@ NetLobbyStatus net_get_status() {
     st.mode = g_lobby_mode;
     st.active = g_tunnel_running.load();
     st.upnp_mapped = g_upnp_ok;
+    st.connected = g_tunnel_connected;
+    if ((st.mode == NetLobbyMode::JoinRoom && !st.connected) || st.mode == NetLobbyMode::HostRoom)
+        st.waiting_seconds = (now_ms() - g_connect_started_ms) / 1000;
     st.local_lan_ip = g_lan_ip;
     st.public_ip = g_public_ip;
     st.room_code = g_room_code;

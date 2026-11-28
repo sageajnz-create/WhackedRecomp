@@ -149,6 +149,7 @@ void poll_host_devices(uint32_t port, bool& out_connected, uint16_t& wButtons,
     wButtons = 0;
     std::memset(analog, 0, 8);
     lx = ly = rx = ry = 0;
+    if (hle_kernel_is_shutting_down()) return;
 
     std::lock_guard<std::mutex> lk(g_inp_mtx);
     ensure_sdl_controllers_scanned();
@@ -312,6 +313,11 @@ void poll_host_devices(uint32_t port, bool& out_connected, uint16_t& wButtons,
                 else if (ev.btn == "LT")    analog[6] = 255;
             }
         }
+    }
+    if (ui_quit_prompt_captures_input()) {
+        wButtons = 0;
+        std::memset(analog, 0, 8);
+        lx = ly = rx = ry = 0;
     }
 }
 
@@ -561,6 +567,20 @@ void hle_input_set_script(const std::string& spec) {
 
 void hle_input_set_frame(uint64_t frame_num) {
     g_auto_frame.store(frame_num, std::memory_order_relaxed);
+}
+
+void hle_input_shutdown() {
+    std::lock_guard<std::mutex> lk(g_inp_mtx);
+    for (int p = 0; p < 4; ++p) {
+        if (g_pads[p].gc) {
+            SDL_GameControllerClose(g_pads[p].gc);
+            g_pads[p].gc = nullptr;
+            g_pads[p].jid = -1;
+            g_pads[p].name.clear();
+            g_pads[p].connected = false;
+        }
+    }
+    g_sdl_gc_inited = false;
 }
 
 void hle_register_input() {

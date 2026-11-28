@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -68,7 +69,10 @@ std::string g_backend_name = "Auto";
 std::atomic<bool> g_launcher_active{false};
 std::atomic<bool> g_overlay_open{false};
 bool g_launch_requested = false;
-bool g_quit_requested = false;
+std::atomic<bool> g_quit_requested{false};
+std::atomic<bool> g_start_screen{false};
+enum class QuitPrompt { Closed, Open, CancelRequested, WaitForRelease };
+std::atomic<QuitPrompt> g_quit_prompt{QuitPrompt::Closed};
 
 void* g_logo_tex = nullptr;
 int   g_logo_w = 0, g_logo_h = 0;
@@ -404,8 +408,8 @@ void push_gfx_settings_to_renderer(bool resize_window) {
     hle_d3d8_set_hd720(cfg.hd720);
 
     if (resize_window && g_sdl_win && !cfg.fullscreen) {
-        SDL_SetWindowSize(g_sdl_win, cfg.width, cfg.height);
-        SDL_SetWindowPosition(g_sdl_win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        fit_window_to_display(g_sdl_win, cfg.width, cfg.height);
+        SDL_GetWindowSize(g_sdl_win, &cfg.width, &cfg.height);
         gfx_resize(cfg.width, cfg.height);
     }
 }
@@ -421,7 +425,7 @@ void render_graphics_tab() {
         {"2560 x 1440 (QHD 1440p)", 2560, 1440},
         {"3840 x 2160 (4K UHD)",    3840, 2160},
     };
-    int cur_res = 0;
+    int cur_res = -1;
     for (int i = 0; i < 5; ++i) {
         if (kPresets[i].w == cfg.width && kPresets[i].h == cfg.height) cur_res = i;
     }
@@ -430,7 +434,9 @@ void render_graphics_tab() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (ImGui::BeginCombo("Window Resolution", kPresets[cur_res].label)) {
+    char fitted_size[64];
+    std::snprintf(fitted_size, sizeof(fitted_size), "%d x %d", cfg.width, cfg.height);
+    if (ImGui::BeginCombo("Window Resolution", (cur_res >= 0 ? kPresets[cur_res].label : fitted_size))) {
         for (int i = 0; i < 5; ++i) {
             bool sel = (i == cur_res);
             if (ImGui::Selectable(kPresets[i].label, sel)) {
@@ -455,14 +461,17 @@ void render_graphics_tab() {
     }
 
 #ifdef _WIN32
-    const char* backends[] = {"Auto (Direct3D 11)", "Direct3D 11", "OpenGL 3.3 Core"};
-    int b_idx = (cfg.renderer == "d3d11") ? 1 : ((cfg.renderer == "opengl") ? 2 : 0);
-    if (ImGui::Combo("Graphics API (Next Launch)", &b_idx, backends, 3)) {
-        cfg.renderer = (b_idx == 1) ? "d3d11" : ((b_idx == 2) ? "opengl" : "auto");
+    const char* backends[] = {"Auto (Direct3D 11)", "Direct3D 11", "OpenGL 3.3 Core", "Vulkan (DXVK)"};
+    int b_idx = cfg.renderer == "vulkan" ? 3 : (cfg.renderer == "d3d11") ? 1 : ((cfg.renderer == "opengl") ? 2 : 0);
+    if (ImGui::Combo("Graphics API (Next Launch)", &b_idx, backends, 4)) {
+        cfg.renderer = b_idx == 3 ? "vulkan" : (b_idx == 1) ? "d3d11" : ((b_idx == 2) ? "opengl" : "auto");
         set_toast("Graphics API preference saved (relaunch to switch backend).");
     }
 #else
-    ImGui::TextDisabled("Active Graphics API: OpenGL 3.3 Core (Linux / WSLg)");
+    const char* backends[] = {"OpenGL", "Vulkan (Mesa Zink)"};
+    int backend = cfg.renderer == "vulkan" ? 1 : 0;
+    if (ImGui::Combo("Graphics API (Next Launch)", &backend, backends, 2))
+        cfg.renderer = backend ? "vulkan" : "opengl";
 #endif
 
     ImGui::Spacing();
@@ -675,124 +684,175 @@ void render_controllers_tab() {
     }
 }
 
+std::future<std::string> g_network_setup;
+std::string g_network_feedback;
+
+void begin_network_setup(int mode) {
+    if (g_network_setup.valid()) return;
+    auto& cfg = app_config();
+    cfg.player_name = g_name_buf[0] ? g_name_buf : "Player";
+    cfg.mp_join_code = g_join_buf;
+    const auto name = cfg.player_name;
+    const auto code = cfg.mp_join_code;
+    const auto port = static_cast<uint16_t>(cfg.mp_tunnel_port);
+    const bool upnp = cfg.mp_upnp;
+    g_network_feedback.clear();
+    g_network_setup = std::async(std::launch::async, [mode, name, code, port, upnp]() -> std::string {
+        bool success = mode == 1 ? net_start_host(port, upnp, name) :
+                       mode == 2 ? net_join_room(code, name) : net_start_offline_lan(name);
+        return success ? "" : "Setup could not finish. Check the details below, then try again.";
+    });
+}
+
 void render_multiplayer_tab() {
     auto& cfg = app_config();
-    NetLobbyStatus st = net_get_status();
-    std::vector<NetPeerInfo> peers = net_list_peers();
-
-    ImGui::TextColored(ImVec4(0.24f, 0.90f, 0.45f, 1.0f), "Cross-Platform System Link & Online Rooms");
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    ImGui::SetNextItemWidth(dp(240.0f));
-    if (ImGui::InputText("Player Handle", g_name_buf, sizeof(g_name_buf))) {
-        cfg.player_name = g_name_buf;
+    if (g_network_setup.valid() &&
+        g_network_setup.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try { g_network_feedback = g_network_setup.get(); }
+        catch (...) { g_network_feedback = "Setup could not finish. Please try again."; }
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("Virtual IP: %s  |  LAN IP: %s",
-                        st.self_virtual_ip.c_str(),
-                        st.local_lan_ip.empty() ? "Detecting..." : st.local_lan_ip.c_str());
+    const bool busy = g_network_setup.valid();
+    const NetLobbyStatus st = net_get_status();
+    const auto peers = net_list_peers();
+
+    ImGui::TextColored(ImVec4(0.24f, 0.90f, 0.45f, 1.0f), "Play with friends");
+    ImGui::TextWrapped("Use controllers on this PC for local multiplayer, or connect PCs below.");
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(std::min(dp(250.0f), ImGui::GetContentRegionAvail().x));
+    ImGui::BeginDisabled(busy || st.mode != NetLobbyMode::OfflineOrLan);
+    if (ImGui::InputText("Your name", g_name_buf, sizeof(g_name_buf))) cfg.player_name = g_name_buf;
+    if (ImGui::IsItemDeactivatedAfterEdit()) begin_network_setup(0);
+    ImGui::EndDisabled();
 
     ImGui::Spacing();
-    ImGui::BeginChild("NetModeBar", ImVec2(0, dp(128.0f)), true);
-    ImGui::Text("Tunnel Status: ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.28f, 0.92f, 0.50f, 1.0f), "%s", st.status_text.c_str());
-    ImGui::SameLine(ImGui::GetWindowWidth() - dp(220.0f));
-    ImGui::TextDisabled("TX: %llu pkts   RX: %llu pkts",
-                        static_cast<unsigned long long>(st.tx_packets),
-                        static_cast<unsigned long long>(st.rx_packets));
-
-    ImGui::Spacing();
-    if (ImGui::RadioButton("LAN / Offline Multicast", cfg.mp_mode == 0)) {
+    ImGui::BeginDisabled(busy);
+    if (ImGui::RadioButton("Same network", cfg.mp_mode == 0)) {
         cfg.mp_mode = 0;
-        net_start_offline_lan(cfg.player_name);
+        if (st.mode != NetLobbyMode::OfflineOrLan || !st.active) begin_network_setup(0);
     }
-    ImGui::SameLine(dp(230.0f));
-    if (ImGui::RadioButton("Host Online Room", cfg.mp_mode == 1)) {
-        cfg.mp_mode = 1;
-    }
-    ImGui::SameLine(dp(440.0f));
-    if (ImGui::RadioButton("Join Friend's Room", cfg.mp_mode == 2)) {
-        cfg.mp_mode = 2;
-    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Create a room", cfg.mp_mode == 1)) cfg.mp_mode = 1;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Join a friend", cfg.mp_mode == 2)) cfg.mp_mode = 2;
+    ImGui::Separator();
 
-    ImGui::Spacing();
-    if (cfg.mp_mode == 1) {
-        ImGui::SetNextItemWidth(dp(110.0f));
-        ImGui::InputInt("UDP Port", &cfg.mp_tunnel_port, 0, 0);
-        cfg.mp_tunnel_port = std::clamp(cfg.mp_tunnel_port, 1024, 65535);
-        ImGui::SameLine();
-        ImGui::Checkbox("Auto UPnP", &cfg.mp_upnp);
-        ImGui::SameLine();
-        if (ImGui::Button("Start / Restart Host")) {
-            cfg.player_name = g_name_buf;
-            if (!net_start_host(static_cast<uint16_t>(cfg.mp_tunnel_port), cfg.mp_upnp, cfg.player_name)) {
-                set_toast("Failed to bind host UDP port!");
+    if (cfg.mp_mode == 0) {
+        ImGui::TextWrapped("Connect every PC to the same Wi-Fi or router. Open Multiplayer, then System Link in Whacked! on each PC. One player creates a match and everyone else joins.");
+        if (!st.active)
+            ImGui::TextWrapped("Local network discovery is unavailable. Check your connection and try again.");
+    } else if (cfg.mp_mode == 1) {
+        if (st.mode != NetLobbyMode::HostRoom || !st.active) {
+            ImGui::TextWrapped("Create a room, then send the room code to your friends. Router setup runs automatically.");
+            if (ImGui::Button("Create room", ImVec2(dp(180), dp(38)))) begin_network_setup(1);
+        } else {
+            ImGui::TextWrapped("Your room is open. Send a code to your friends and keep Whacked! running.");
+            const bool public_code = !st.public_ip.empty();
+            if (public_code) {
+                ImGui::Text("Room code");
+                ImGui::TextColored(ImVec4(0.98f, 0.80f, 0.25f, 1), "%s", st.room_code.c_str());
+                if (ImGui::Button("Copy room code")) {
+                    if (SDL_SetClipboardText(st.room_code.c_str()) == 0)
+                        g_network_feedback = "Room code copied. Send it to your friends.";
+                    else g_network_feedback = "Could not copy. Select the code below to copy it manually.";
+                }
+                ImGui::SetNextItemWidth(std::min(dp(300), ImGui::GetContentRegionAvail().x));
+                char code[96]{};
+                std::snprintf(code, sizeof(code), "%s", st.room_code.c_str());
+                ImGui::InputText("##ShareRoomCode", code, sizeof(code), ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
+                if (!st.upnp_mapped)
+                    ImGui::TextWrapped("If friends cannot connect, open Connection help below. Your router may need an extra step.");
             } else {
-                set_toast("Online System Link Room hosted!");
+                ImGui::TextWrapped(st.waiting_seconds < 12 ?
+                    "Finding your internet address... You can already invite someone on the same Wi-Fi." :
+                    "Your internet address could not be found yet. Use the same-network code for Wi-Fi friends, or open Connection help.");
+
             }
-        }
-        if (st.mode == NetLobbyMode::HostRoom && !st.room_code.empty()) {
-            ImGui::TextColored(ImVec4(0.98f, 0.80f, 0.25f, 1.0f), "Room Code: %s", st.room_code.c_str());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Copy Code")) {
-                SDL_SetClipboardText(st.room_code.c_str());
-                set_toast("Copied room code to clipboard!");
+            if (ImGui::Button("Copy same-network code")) {
+                std::string code;
+                if (net_encode_room_code(st.local_lan_ip, static_cast<uint16_t>(cfg.mp_tunnel_port), code) &&
+                    SDL_SetClipboardText(code.c_str()) == 0)
+                    g_network_feedback = "Same-network code copied. Share this with someone on your Wi-Fi.";
             }
-            if (!st.public_ip.empty()) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("(External: %s:%d%s)", st.public_ip.c_str(), cfg.mp_tunnel_port,
-                                    st.upnp_mapped ? " [UPnP OK]" : "");
-            } else {
-                ImGui::SameLine();
-                ImGui::TextDisabled("(LAN Direct: %s)", st.host_endpoint.c_str());
-            }
-        }
-    } else if (cfg.mp_mode == 2) {
-        ImGui::SetNextItemWidth(dp(300.0f));
-        if (ImGui::InputText("Room Code or IP:Port", g_join_buf, sizeof(g_join_buf))) {
-            cfg.mp_join_code = g_join_buf;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Connect to Room")) {
-            cfg.player_name = g_name_buf;
-            cfg.mp_join_code = g_join_buf;
-            if (net_join_room(cfg.mp_join_code, cfg.player_name)) {
-                set_toast("Connecting to System Link room...");
-            } else {
-                set_toast("Invalid room code or unreachable address.");
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Leave Room")) {
-            cfg.mp_mode = 0;
-            net_start_offline_lan(cfg.player_name);
+            ImGui::TextWrapped("Next, open Multiplayer > System Link in Whacked! and create a match.");
         }
     } else {
-        ImGui::TextDisabled("Zero-config LAN multicast (239.69.69.1:30741). Multiple local/LAN instances discover each other automatically.");
+        ImGui::TextWrapped("Ask your friend to create a room and send you their code.");
+        ImGui::SetNextItemWidth(std::min(dp(300), ImGui::GetContentRegionAvail().x));
+        const bool enter = ImGui::InputTextWithHint("##RoomCode", "Paste your friend's room code", g_join_buf, sizeof(g_join_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemEdited()) cfg.mp_join_code = g_join_buf;
+        if (ImGui::Button("Paste code")) {
+            char* clipboard = SDL_GetClipboardText();
+            if (clipboard) {
+                std::snprintf(g_join_buf, sizeof(g_join_buf), "%s", clipboard);
+                cfg.mp_join_code = g_join_buf;
+                SDL_free(clipboard);
+            }
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!g_join_buf[0]);
+        const bool join = ImGui::Button(st.mode == NetLobbyMode::JoinRoom ? "Reconnect" : "Join room");
+        ImGui::EndDisabled();
+        if ((enter || join) && g_join_buf[0]) begin_network_setup(2);
+        if (st.mode == NetLobbyMode::JoinRoom) {
+            if (st.connected)
+                ImGui::TextWrapped("You're connected! Open Multiplayer > System Link in Whacked! and join your friend's match.");
+            else if (st.waiting_seconds >= 12)
+                ImGui::TextWrapped("Your friend hasn't replied yet. Check the code, ask them to keep the room open, and see Connection help below. We'll keep trying.");
+            else
+                ImGui::Text("Connecting... %llu seconds", static_cast<unsigned long long>(st.waiting_seconds));
+        }
     }
-    ImGui::EndChild();
+    ImGui::EndDisabled();
 
     ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.24f, 0.90f, 0.45f, 1.0f), "Connected Players (%zu)", peers.size());
-    if (ImGui::BeginTable("PeerTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, dp(120.0f)))) {
-        ImGui::TableSetupColumn("Player");
-        ImGui::TableSetupColumn("Virtual Xbox IP");
-        ImGui::TableSetupColumn("Ping");
-        ImGui::TableSetupColumn("Role");
-        ImGui::TableHeadersRow();
-        for (const auto& p : peers) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::Text("%s%s", p.player_name.c_str(), p.is_self ? " (You)" : "");
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(p.virtual_ip_str.c_str());
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%d ms", p.ping_ms);
-            ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(p.is_host ? "Host" : "Peer");
+    if (busy) ImGui::TextWrapped("Setting up your connection...");
+    if (!g_network_feedback.empty())
+        ImGui::TextWrapped("%s", g_network_feedback.c_str());
+    if (st.mode != NetLobbyMode::OfflineOrLan || !st.active) {
+        if (st.mode != NetLobbyMode::JoinRoom)
+            ImGui::TextWrapped("%s", st.status_text.c_str());
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button(st.mode == NetLobbyMode::HostRoom ? "Close room" : "Leave room")) {
+            cfg.mp_mode = 0;
+            begin_network_setup(0);
         }
-        ImGui::EndTable();
+        ImGui::EndDisabled();
     }
 
-    ImGui::TextDisabled("Tip: Inside Whacked!, open Multiplayer -> System Link to Host or Join matches over LAN or Online Tunnel.");
+    ImGui::Spacing();
+    ImGui::Text("Players in this room");
+    for (const auto& peer : peers) {
+        if (peer.is_self) ImGui::BulletText("%s (you)", peer.player_name.c_str());
+        else ImGui::BulletText("%s%s - %d ms", peer.player_name.c_str(), peer.is_host ? " (host)" : "", peer.ping_ms);
+    }
+    if (peers.size() <= 1)
+        ImGui::TextWrapped(st.mode == NetLobbyMode::OfflineOrLan ?
+            "Nearby PCs meet inside the game's System Link menu." : "Waiting for friends to connect.");
+
+    if (!g_launcher_active) {
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Back to game", ImVec2(dp(180), dp(34)))) g_overlay_open = false;
+        ImGui::EndDisabled();
+    }
+
+    if (ImGui::CollapsingHeader("Connection help")) {
+        ImGui::TextWrapped("Use the same version of WhackedRecomp on every PC. Allow WhackedRecomp through your firewall when Windows asks.");
+        ImGui::TextWrapped("For internet games, the host keeps the room open and shares the internet room code. If it fails, try letting another friend host.");
+        ImGui::TextWrapped("Some routers and mobile connections block incoming games. The host can forward the UDP port shown under Advanced settings to their PC, or everyone can use a shared VPN network and the same-network code.");
+        ImGui::TextWrapped("Once connected, every player opens Multiplayer > System Link in Whacked!. The room host creates the match there.");
+    }
+    if (ImGui::CollapsingHeader("Advanced settings")) {
+        ImGui::BeginDisabled(busy || st.mode != NetLobbyMode::OfflineOrLan);
+        ImGui::SetNextItemWidth(dp(120));
+        ImGui::InputInt("Host port (UDP)", &cfg.mp_tunnel_port, 0, 0);
+        cfg.mp_tunnel_port = std::clamp(cfg.mp_tunnel_port, 1024, 65535);
+        ImGui::Checkbox("Automatic router setup (UPnP)", &cfg.mp_upnp);
+        ImGui::EndDisabled();
+        ImGui::TextWrapped("Close your room before changing its port or router settings. Joining also accepts a hostname or IP address with an optional port.");
+        ImGui::TextWrapped("Local address %s | Virtual address %s", st.local_lan_ip.c_str(), st.self_virtual_ip.c_str());
+        ImGui::Text("Router mapping %s", st.upnp_mapped ? "active" : "unavailable");
+        ImGui::Text("Sent %llu | Received %llu packets", static_cast<unsigned long long>(st.tx_packets), static_cast<unsigned long long>(st.rx_packets));
+    }
 }
 
 void render_system_tools_tab() {
@@ -1075,7 +1135,7 @@ void render_launcher_window() {
         g_quit_requested = true;
     }
     ImGui::SameLine();
-    ImGui::BeginDisabled(!g_iso_ok);
+    ImGui::BeginDisabled(!g_iso_ok || g_network_setup.valid());
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.11f, 0.56f, 0.24f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.72f, 0.32f, 1.0f));
     if (ImGui::Button("PLAY WHACKED!", ImVec2(dp(175.0f), dp(34.0f)))) {
@@ -1104,7 +1164,7 @@ void render_overlay_window() {
                                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
                                          ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
             if (ImGui::Begin("WhackedFpsHud", nullptr, hud_flags)) {
-                ImGui::Text("%.1f FPS | %s | [F1] Menu", gfx_get_fps(), gfx_is_opengl() ? "OpenGL" : "D3D11");
+                ImGui::Text("%.1f FPS | %s | [F1] Menu", gfx_get_fps(), gfx_settings().backend == GfxBackendKind::Vulkan ? "Vulkan" : (gfx_is_opengl() ? "OpenGL" : "D3D11"));
             }
             ImGui::End();
         }
@@ -1179,7 +1239,70 @@ void render_overlay_window() {
     ImGui::End();
 }
 
+void render_quit_prompt() {
+    const auto state = g_quit_prompt.load();
+    if (state == QuitPrompt::Closed) return;
+    if (state == QuitPrompt::WaitForRelease) {
+        if (!ImGui::IsKeyDown(ImGuiKey_Escape) && !ImGui::IsKeyDown(ImGuiKey_Enter) &&
+            !ImGui::IsKeyDown(ImGuiKey_KeypadEnter) && !ImGui::IsKeyDown(ImGuiKey_Space) &&
+            !ImGui::IsKeyDown(ImGuiKey_GamepadFaceRight) && !ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown)) {
+            g_quit_prompt = QuitPrompt::Closed;
+        }
+        return;
+    }
+
+    constexpr const char* title = "Quit Game?";
+    if (!ImGui::IsPopupOpen(title)) ImGui::OpenPopup(title);
+    const auto* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.02f, 0.03f, 0.06f, 0.64f));
+    if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (ImGui::IsWindowAppearing()) ImGui::SetNavCursorVisible(true);
+    ImGui::SetWindowFontScale(1.3f);
+    const ImVec2 button_size(dp(136.0f), dp(42.0f));
+    ImGui::Spacing();
+    const bool quit = ImGui::Button("Yes, Quit", button_size);
+    ImGui::SameLine();
+    const bool cancel = ImGui::Button("Cancel", button_size) ||
+                        g_quit_prompt.load() == QuitPrompt::CancelRequested;
+    ImGui::SetItemDefaultFocus();
+    if (quit || cancel) {
+        ImGui::CloseCurrentPopup();
+        g_quit_prompt = QuitPrompt::WaitForRelease;
+        if (quit && !cancel) g_quit_requested = true;
+    }
+    ImGui::EndPopup();
+    ImGui::PopStyleColor();
+}
+
 } // namespace
+
+void fit_window_to_display(SDL_Window* window, int width, int height) {
+    SDL_Rect area{};
+    int display = SDL_GetWindowDisplayIndex(window);
+    if (SDL_GetDisplayUsableBounds(display, &area) != 0) return;
+    int top = 0, left = 0, bottom = 0, right = 0;
+    SDL_GetWindowBordersSize(window, &top, &left, &bottom, &right);
+    int available_w = std::max(1, area.w - left - right);
+    int available_h = std::max(1, area.h - top - bottom);
+    width = std::max(1, width);
+    height = std::max(1, height);
+    double scale = std::min({1.0, double(available_w) / width, double(available_h) / height});
+    width = std::max(1, int(width * scale));
+    height = std::max(1, int(height * scale));
+    SDL_SetWindowSize(window, width, height);
+    SDL_SetWindowPosition(window, area.x + left + (available_w - width) / 2,
+                          area.y + top + (available_h - height) / 2);
+}
+
+void ui_finish_network_setup() {
+    if (g_network_setup.valid()) {
+        try { g_network_setup.get(); } catch (...) {}
+    }
+}
 
 void ui_set_userdata_root(const std::string& root) { g_userdata_root = root; }
 void ui_set_iso_status(const std::string& iso_path, bool ok, const std::string& detail) {
@@ -1238,6 +1361,7 @@ void ui_init_gl3(void* sdl_win, void* gl_ctx) {
 }
 
 void ui_shutdown() {
+    ui_finish_network_setup();
     if (!g_imgui_inited.exchange(false, std::memory_order_acq_rel)) return;
     g_ui_wants_kb.store(false, std::memory_order_release);
     g_ui_wants_mouse.store(false, std::memory_order_release);
@@ -1322,18 +1446,36 @@ bool ui_consume_launch_requested() {
 }
 
 bool ui_consume_quit_requested() {
-    bool v = g_quit_requested;
-    g_quit_requested = false;
-    return v;
+    return g_quit_requested.exchange(false);
 }
 
 void ui_set_overlay_open(bool open) { g_overlay_open = open; }
 void ui_toggle_overlay() {
-    if (!g_launcher_active.load(std::memory_order_acquire)) {
+    if (!g_launcher_active.load(std::memory_order_acquire) && !ui_quit_prompt_captures_input()) {
         g_overlay_open.store(!g_overlay_open.load(std::memory_order_acquire), std::memory_order_release);
     }
 }
 bool ui_is_overlay_open() { return g_overlay_open; }
+
+void ui_set_start_screen(bool active) { g_start_screen = active; }
+
+bool ui_handle_quit_shortcut(const void* ev_ptr) {
+    const auto& event = *static_cast<const SDL_Event*>(ev_ptr);
+    const bool escape = event.type == SDL_KEYDOWN && !event.key.repeat &&
+                        event.key.keysym.scancode == SDL_SCANCODE_ESCAPE;
+    const bool face_right = event.type == SDL_CONTROLLERBUTTONDOWN &&
+                            event.cbutton.button == SDL_CONTROLLER_BUTTON_B;
+    if ((!escape && !face_right) || !g_imgui_inited || g_launcher_active || g_overlay_open) return false;
+
+    auto state = QuitPrompt::Open;
+    if (g_quit_prompt.compare_exchange_strong(state, QuitPrompt::CancelRequested)) return true;
+    if (state != QuitPrompt::Closed) return true;
+    if (!g_start_screen) return false;
+    g_quit_prompt = QuitPrompt::Open;
+    return true;
+}
+
+bool ui_quit_prompt_captures_input() { return g_quit_prompt.load() != QuitPrompt::Closed; }
 
 void ui_render_frame(bool is_opengl) {
     if (!g_imgui_inited) return;
@@ -1362,13 +1504,14 @@ void ui_render_frame(bool is_opengl) {
     }
 
     ImGuiIO& io = ImGui::GetIO();
-    if (g_launcher_active || g_overlay_open) {
+    const bool ui_active = g_launcher_active || g_overlay_open || ui_quit_prompt_captures_input();
+    if (ui_active) {
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     } else {
         io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     }
-    g_ui_wants_kb.store((g_launcher_active || g_overlay_open) && io.WantCaptureKeyboard, std::memory_order_release);
-    g_ui_wants_mouse.store((g_launcher_active || g_overlay_open) && io.WantCaptureMouse, std::memory_order_release);
+    g_ui_wants_kb.store(ui_active && io.WantCaptureKeyboard, std::memory_order_release);
+    g_ui_wants_mouse.store(ui_active && io.WantCaptureMouse, std::memory_order_release);
 
     if (is_opengl) {
         ImGui_ImplOpenGL3_NewFrame();
@@ -1384,6 +1527,7 @@ void ui_render_frame(bool is_opengl) {
         render_launcher_window();
     } else {
         render_overlay_window();
+        render_quit_prompt();
     }
 
     ImGui::Render();

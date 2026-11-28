@@ -1,4 +1,5 @@
 #include "hle_common.h"
+#include "launcher_ui.h"
 #include "gfx_backend.h"
 #include "nv2a_shaders.h"
 #include "rl_achievements.h"
@@ -14,6 +15,7 @@
 
 // External frame counter / automation hooks in main.cpp
 extern void app_on_frame_presented(uint64_t frame_num);
+extern void fn_000a0d10(CpuContext& ctx);
 
 namespace {
 
@@ -22,7 +24,7 @@ constexpr uint32_t kGuestDevicePtrVA   = 0x002529B0u;
 constexpr uint32_t kGuestIndexBaseVA   = 0x002529B8u;
 constexpr uint32_t kGuestDirtyFlagsVA  = 0x002529BCu;
 constexpr uint32_t kGuestTSSBaseVA     = 0x002529C0u; // 4 stages x 32 DWORDs
-constexpr uint32_t kGuestRSBaseVA      = 0x00252BC0u; // 166 DWORDs (0..165)
+constexpr uint32_t kGuestRSBaseVA      = 0x00252BC0u; // 170 DWORDs (0..169)
 constexpr uint32_t kGuestVSConstVA     = 0x00253DD8u; // 192 * 4 floats
 
 // Xbox D3D Render State IDs verified against D3D__RenderStateMap (0x2C3630 & 0x235100..0x236FF0)
@@ -45,23 +47,31 @@ enum XbRenderState : uint32_t {
     XBRS_STENCILMASK        = 72,  // 0x036C
     XBRS_STENCILWRITEMASK   = 73,  // 0x0360
     XBRS_BLENDOP            = 74,  // 0x0350
+    XBRS_POLYGONOFFSETZSLOPESCALE = 77, // 0x4D -> 0x0384
+    XBRS_POLYGONOFFSETZOFFSET     = 78, // 0x4E -> 0x0388
+    XBRS_POINTOFFSETENABLE        = 79, // 0x4F -> 0x0330
+    XBRS_WIREFRAMEOFFSETENABLE    = 80, // 0x50 -> 0x0334
+    XBRS_SOLIDOFFSETENABLE        = 81, // 0x51 -> 0x0338
     XBRS_SPECULARENABLE     = 82,  // 0x1D78
     XBRS_LIGHTING           = 136, // 0x88
     XBRS_STENCILENABLE      = 137, // 0x89
     XBRS_TEXTUREFACTOR      = 138, // 0x8A
-    XBRS_STENCILFAIL        = 139, // fallback/explicit NV097 0x0370
-    XBRS_CULLMODE           = 142, // 0x8E
+    XBRS_FILLMODE           = 139, // 0x8B -> 0x038C (front polygon mode)
+    XBRS_BACKFILLMODE       = 140, // 0x8C -> 0x0390 (back polygon mode)
+    XBRS_TWOSIDEDLIGHTING   = 141, // 0x8D
+    XBRS_NORMALIZENORMALS   = 142, // 0x8E -> 0x03A4
     XBRS_ZENABLE            = 143, // 0x8F
     XBRS_FOGENABLE          = 144, // 0x90
     XBRS_FOGTABLEMODE       = 145, // 0x91
-    XBRS_FRONTFACE          = 146, // 0x92
-    XBRS_FILLMODE           = 147, // 0x93
+    XBRS_FRONTFACE          = 146, // 0x92 -> 0x03A0
+    XBRS_CULLMODE           = 147, // 0x93 -> 0x0308 + 0x039C
     XBRS_SPECULARENABLE_RS  = 151, // 0x97
     XBRS_FOGCOLOR           = 156, // 0x9C
     XBRS_FOGDENSITY         = 157, // 0x9D
     XBRS_YUVENABLE          = 159, // 0x9F
     XBRS_FOGSTART           = 160, // 0xA0
     XBRS_FOGEND             = 161, // 0xA1
+    XBRS_STENCILFAIL        = 166, // explicit NV097 0x0370 slot (distinct from 0x8B..0xA5)
 };
 
 // Xbox D3D Texture Stage State IDs observed at 0x0011A0C0
@@ -204,6 +214,16 @@ bool     g_ss_prog_fb_mode = false;
 bool     g_cur_frame_had_prog_ss = false;
 bool     g_cur_frame_saw_hd_ss = false;
 uint32_t g_cur_frame_3d_draws = 0;
+std::atomic<bool> g_cur_frame_start_screen{false};
+
+void draw_frontend_screen(CpuContext& ctx) {
+    // This guest routine draws the frontend screen selected at 0x0037EF9C.
+    // Screen 1 is the root MainMenu. Submenus use other screen IDs.
+    if (rd32(0x0037EF9Cu) == 1u) {
+        g_cur_frame_start_screen.store(true, std::memory_order_relaxed);
+    }
+    fn_000a0d10(ctx);
+}
 std::atomic<uint64_t> g_frame_counter{0};
 uint32_t g_vis_counter = 1;
 
@@ -262,7 +282,7 @@ void write_surface_struct(uint32_t surf_va, uint32_t data_va, uint32_t fmt, uint
 
 void init_render_state_defaults() {
     std::memset(mem_ptr(kGuestTSSBaseVA), 0, 4 * 32 * 4);
-    std::memset(mem_ptr(kGuestRSBaseVA), 0, 166 * 4);
+    std::memset(mem_ptr(kGuestRSBaseVA), 0, 170 * 4);
 
     wr32(kGuestRSBaseVA + XBRS_ZENABLE * 4u, 1u);
     wr32(kGuestRSBaseVA + XBRS_ZWRITEENABLE * 4u, 1u);
@@ -274,8 +294,18 @@ void init_render_state_defaults() {
     wr32(kGuestRSBaseVA + XBRS_SRCBLEND * 4u, 2u); // ONE
     wr32(kGuestRSBaseVA + XBRS_DESTBLEND * 4u, 1u); // ZERO
     wr32(kGuestRSBaseVA + XBRS_BLENDOP * 4u, 0x8006u); // GL FUNC_ADD or 1
-    wr32(kGuestRSBaseVA + XBRS_CULLMODE * 4u, 3u); // CCW? Wait: 2=CW, 3=CCW in D3DCULL or NV097
+    wr32(kGuestRSBaseVA + XBRS_FILLMODE * 4u, 0x1B02u); // GL_FILL
+    wr32(kGuestRSBaseVA + XBRS_BACKFILLMODE * 4u, 0x1B02u);
+    wr32(kGuestRSBaseVA + XBRS_FRONTFACE * 4u, 0x0900u); // CW
+    wr32(kGuestRSBaseVA + XBRS_CULLMODE * 4u, 0x0901u);  // CCW
     wr32(kGuestRSBaseVA + XBRS_COLORWRITEENABLE * 4u, 0x01010101u);
+    wr32(kGuestRSBaseVA + XBRS_STENCILFAIL * 4u, 0x1E00u);      // GL_KEEP
+    wr32(kGuestRSBaseVA + XBRS_STENCILZFAIL * 4u, 0x1E00u);     // GL_KEEP
+    wr32(kGuestRSBaseVA + XBRS_STENCILPASS * 4u, 0x1E00u);      // GL_KEEP
+    wr32(kGuestRSBaseVA + XBRS_STENCILFUNC * 4u, 0x0207u);      // GL_ALWAYS
+    wr32(kGuestRSBaseVA + XBRS_STENCILREF * 4u, 0u);
+    wr32(kGuestRSBaseVA + XBRS_STENCILMASK * 4u, 0xFFFFFFFFu);
+    wr32(kGuestRSBaseVA + XBRS_STENCILWRITEMASK * 4u, 0xFFFFFFFFu);
     wr32(kGuestRSBaseVA + XBRS_LIGHTING * 4u, 1u);
 
     for (uint32_t s = 0; s < 4; ++s) {
@@ -413,7 +443,7 @@ void unpack_argb_to_f4(uint32_t c, float out[4]) {
 // ---------- RenderState & NV097 Sync ----------
 void hle_D3DDevice_SetRenderState_idx(uint32_t rs, uint32_t val) {
     ensure_guest_device_allocated();
-    if (rs < 166u) {
+    if (rs < 170u) {
         wr32(kGuestRSBaseVA + rs * 4u, val);
     }
 }
@@ -424,12 +454,15 @@ void apply_nv097_method(uint32_t method, uint32_t val) {
         case 0x0300u: wr32(kGuestRSBaseVA + XBRS_ALPHATESTENABLE * 4u, val); break;
         case 0x0304u: wr32(kGuestRSBaseVA + XBRS_ALPHABLENDENABLE * 4u, val); break;
         case 0x0308u:
-            if (!val) wr32(kGuestRSBaseVA + XBRS_CULLMODE * 4u, 1u);
-            else if (rd32(kGuestRSBaseVA + XBRS_CULLMODE * 4u) <= 1u) wr32(kGuestRSBaseVA + XBRS_CULLMODE * 4u, 3u);
+            if (!val) wr32(kGuestRSBaseVA + XBRS_CULLMODE * 4u, 0u);
+            else if (rd32(kGuestRSBaseVA + XBRS_CULLMODE * 4u) <= 1u) wr32(kGuestRSBaseVA + XBRS_CULLMODE * 4u, 0x0901u);
             break;
         case 0x030Cu: wr32(kGuestRSBaseVA + XBRS_ZENABLE * 4u, val); break;
         case 0x0328u: wr32(kGuestRSBaseVA + XBRS_STENCILENABLE * 4u, val); break;
         case 0x032Cu: wr32(kGuestRSBaseVA + XBRS_FOGENABLE * 4u, val); break;
+        case 0x0330u: wr32(kGuestRSBaseVA + XBRS_POINTOFFSETENABLE * 4u, val); break;
+        case 0x0334u: wr32(kGuestRSBaseVA + XBRS_WIREFRAMEOFFSETENABLE * 4u, val); break;
+        case 0x0338u: wr32(kGuestRSBaseVA + XBRS_SOLIDOFFSETENABLE * 4u, val); break;
         case 0x033Cu: wr32(kGuestRSBaseVA + XBRS_ALPHAFUNC * 4u, val); break;
         case 0x0340u: wr32(kGuestRSBaseVA + XBRS_ALPHAREF * 4u, val); break;
         case 0x0344u: wr32(kGuestRSBaseVA + XBRS_SRCBLEND * 4u, val); break;
@@ -445,7 +478,19 @@ void apply_nv097_method(uint32_t method, uint32_t val) {
         case 0x0370u: wr32(kGuestRSBaseVA + XBRS_STENCILFAIL * 4u, val); break;
         case 0x0374u: wr32(kGuestRSBaseVA + XBRS_STENCILZFAIL * 4u, val); break;
         case 0x0378u: wr32(kGuestRSBaseVA + XBRS_STENCILPASS * 4u, val); break;
-        case 0x03A4u: wr32(kGuestRSBaseVA + XBRS_CULLMODE * 4u, val); break;
+        case 0x0384u: wr32(kGuestRSBaseVA + XBRS_POLYGONOFFSETZSLOPESCALE * 4u, val); break;
+        case 0x0388u: wr32(kGuestRSBaseVA + XBRS_POLYGONOFFSETZOFFSET * 4u, val); break;
+        case 0x038Cu: wr32(kGuestRSBaseVA + XBRS_FILLMODE * 4u, val); break;
+        case 0x0390u: wr32(kGuestRSBaseVA + XBRS_BACKFILLMODE * 4u, val); break;
+        case 0x039Cu: {
+            uint32_t ff = rd32(kGuestRSBaseVA + XBRS_FRONTFACE * 4u);
+            if (ff != 0x0900u && ff != 0x0901u) ff = 0x0900u;
+            uint32_t cm = (val == 0x0404u) ? ff : (ff == 0x0900u ? 0x0901u : 0x0900u);
+            wr32(kGuestRSBaseVA + XBRS_CULLMODE * 4u, cm);
+            break;
+        }
+        case 0x03A0u: wr32(kGuestRSBaseVA + XBRS_FRONTFACE * 4u, val); break;
+        case 0x03A4u: wr32(kGuestRSBaseVA + XBRS_NORMALIZENORMALS * 4u, val); break;
         case 0x02A8u: wr32(kGuestRSBaseVA + XBRS_TEXTUREFACTOR * 4u, val); break;
         case 0x1D78u: wr32(kGuestRSBaseVA + XBRS_SPECULARENABLE * 4u, val); break;
         case 0x1E6Cu: wr32(kGuestRSBaseVA + XBRS_FOGCOLOR * 4u, val); break;
@@ -455,6 +500,7 @@ void apply_nv097_method(uint32_t method, uint32_t val) {
 
 void sync_and_draw(uint32_t prim_type, uint32_t vertex_count, uint32_t index_count,
                    const void* inline_verts, uint32_t inline_stride, const uint16_t* indices, int32_t base_vtx) {
+    if (hle_kernel_is_shutting_down()) return;
     std::lock_guard<std::mutex> lk(g_d3d_mtx);
     ensure_guest_device_allocated();
 
@@ -471,7 +517,8 @@ void sync_and_draw(uint32_t prim_type, uint32_t vertex_count, uint32_t index_cou
     st.vp_x = g_vp_x; st.vp_y = g_vp_y; st.vp_w = g_vp_w; st.vp_h = g_vp_h;
     st.vp_minz = g_vp_minz; st.vp_maxz = g_vp_maxz;
 
-    // Sync vertex shader & decl
+    // Sync vertex shader & decl (ensure GL context is current on this thread before compiling shaders)
+    gfx_ensure_gl_current();
     uint32_t guest_vs = rd32(g_dev_va + 0x380u);
     if (guest_vs) g_cur_vs_handle = guest_vs;
 
@@ -537,6 +584,11 @@ void sync_and_draw(uint32_t prim_type, uint32_t vertex_count, uint32_t index_cou
     st.z_write = rd32(kGuestRSBaseVA + XBRS_ZWRITEENABLE * 4u) != 0;
     st.z_func = normalize_cmp_func(rd32(kGuestRSBaseVA + XBRS_ZFUNC * 4u));
     st.cull_mode = normalize_cull(rd32(kGuestRSBaseVA + XBRS_CULLMODE * 4u));
+    uint32_t fm = rd32(kGuestRSBaseVA + XBRS_FILLMODE * 4u);
+    st.fill_mode = (fm == 0x1B01u || fm == 2u) ? 2u : 3u;
+    st.poly_offset_fill = rd32(kGuestRSBaseVA + XBRS_SOLIDOFFSETENABLE * 4u) != 0;
+    st.poly_offset_scale = rdf32(kGuestRSBaseVA + XBRS_POLYGONOFFSETZSLOPESCALE * 4u);
+    st.poly_offset_bias = rdf32(kGuestRSBaseVA + XBRS_POLYGONOFFSETZOFFSET * 4u);
     uint32_t cwe = rd32(kGuestRSBaseVA + XBRS_COLORWRITEENABLE * 4u);
     st.color_write_mask = (cwe > 0xFu)
         ? (((cwe & 0xFF000000u) ? 8u : 0u) | ((cwe & 0x00FF0000u) ? 1u : 0u) | ((cwe & 0x0000FF00u) ? 2u : 0u) | ((cwe & 0x000000FFu) ? 4u : 0u))
@@ -756,15 +808,15 @@ void NAME(CpuContext& ctx) { \
 
 DEF_RS_HOOK(hle_RS_89_StencilEnable, 0x89u, 0x0328u)
 DEF_RS_HOOK(hle_RS_8A_TexFactor,     0x8Au, 0x02A8u)
-DEF_RS_HOOK(hle_RS_8B_PolyBias,      0x8Bu, 0u)
-DEF_RS_HOOK(hle_RS_8C_ZBias,         0x8Cu, 0u)
+DEF_RS_HOOK(hle_RS_8B_PolyBias,      0x8Bu, 0x038Cu)
+DEF_RS_HOOK(hle_RS_8C_ZBias,         0x8Cu, 0x0390u)
 DEF_RS_HOOK(hle_RS_8D_PolyOffset,    0x8Du, 0u)
 DEF_RS_HOOK(hle_RS_8E_CullMode,      0x8Eu, 0x03A4u)
 DEF_RS_HOOK(hle_RS_8F_ZEnable,       0x8Fu, 0x030Cu)
 DEF_RS_HOOK(hle_RS_90_FogEnable,     0x90u, 0x032Cu)
 DEF_RS_HOOK(hle_RS_91_FogTableMode,  0x91u, 0u)
-DEF_RS_HOOK(hle_RS_92_FrontFace,     0x92u, 0u)
-DEF_RS_HOOK(hle_RS_93_FillCullEn,    0x93u, 0x0308u)
+DEF_RS_HOOK(hle_RS_92_FrontFace,     0x92u, 0x03A0u)
+DEF_RS_HOOK(hle_RS_93_FillCullEn,    0x93u, 0u)
 DEF_RS_HOOK(hle_RS_94_PSFlags,       0x94u, 0u)
 DEF_RS_HOOK(hle_RS_95_Wrap,          0x95u, 0u)
 DEF_RS_HOOK(hle_RS_96_TexGen,        0x96u, 0u)
@@ -1252,12 +1304,19 @@ void hle_D3D_CopyRects(CpuContext& ctx) {
 
 void hle_D3D_Clear(CpuContext& ctx) {
     // 0x00239D10: (Count, pRects, Flags, Color, Z, Stencil) -> ret 24
-    uint32_t flags = hle_arg(ctx, 2);
+    // Xbox D3DCLEAR flags differ from PC D3D8 / gfx_clear flags:
+    //   Xbox: D3DCLEAR_ZBUFFER = 0x01, D3DCLEAR_STENCIL = 0x02, D3DCLEAR_TARGET* = 0xF0 (RGBA bits 4..7)
+    //   gfx_clear: 1 = color target, 2 = depth, 4 = stencil
+    uint32_t xb_flags = hle_arg(ctx, 2);
     uint32_t color = hle_arg(ctx, 3);
     uint32_t z_u32 = hle_arg(ctx, 4);
     uint32_t stencil = hle_arg(ctx, 5);
     float z = 1.0f;
     std::memcpy(&z, &z_u32, 4);
+    uint32_t gfx_flags = 0;
+    if (xb_flags & 0xF0u) gfx_flags |= 1u;
+    if (xb_flags & 0x01u) gfx_flags |= 2u;
+    if (xb_flags & 0x02u) gfx_flags |= 4u;
 
     GpuTextureObj* custom_rt = nullptr;
     {
@@ -1270,7 +1329,7 @@ void hle_D3D_Clear(CpuContext& ctx) {
             }
         }
     }
-    gfx_clear(flags, color, z, stencil, custom_rt);
+    gfx_clear(gfx_flags, color, z, stencil, custom_rt);
     hle_ret(ctx, 24);
 }
 
@@ -1464,7 +1523,7 @@ void hle_D3D_VertexBufferLock(CpuContext& ctx) {
 } // namespace
 static bool g_hd720_req = false;
 void hle_d3d8_set_hd720(bool enable) { g_hd720_req = enable; }
-void hle_d3d8_mark_va_dirty(uint32_t va) {
+void hle_d3d8_mark_bink_frame(uint32_t va) {
     if (!va) return;
     std::lock_guard<std::mutex> lk(g_d3d_mtx);
     for (auto& [tva, gt] : g_textures) {
@@ -1474,6 +1533,7 @@ void hle_d3d8_mark_va_dirty(uint32_t va) {
         uint32_t end = start + gt.data_bytes;
         if (va >= start && va < end) {
             gt.gpu->dirty = true;
+            gt.gpu->is_bink_frame = true;
             gt.locked_ever = true;
             gt.unchanged_checks = 0;
             gt.next_check_frame = 0;
@@ -1590,6 +1650,7 @@ void hle_D3D_GetSuperSampleScale(CpuContext& ctx) {
 
 void hle_D3D_Swap(CpuContext& ctx) {
     // 0x0023E090: Swap(Flags) -> ret 4
+    if (hle_kernel_is_shutting_down()) throw GuestPowerOff{};
     bool has_3d = false;
     {
         std::lock_guard<std::mutex> lk(g_d3d_mtx);
@@ -1600,6 +1661,7 @@ void hle_D3D_Swap(CpuContext& ctx) {
         g_cur_frame_saw_hd_ss = false;
         has_3d = (g_cur_frame_3d_draws > 0);
         g_cur_frame_3d_draws = 0;
+        ui_set_start_screen(g_cur_frame_start_screen.exchange(false, std::memory_order_relaxed));
     }
     hle_kernel_notify_frame();
     uint64_t f = g_frame_counter.fetch_add(1ull) + 1ull;
@@ -1623,6 +1685,7 @@ void hle_D3D_Swap(CpuContext& ctx) {
         }
     }
     hle_kernel_update_ticks();
+    if (hle_kernel_is_shutting_down()) throw GuestPowerOff{};
     hle_ret_u32(ctx, 0u, 4);
 }
 
@@ -1985,6 +2048,7 @@ void hle_XGSetTextureHeader(CpuContext& ctx) {
 } // namespace
 
 void hle_register_d3d8() {
+    recomp_register_fn(0x000A0D10u, draw_frontend_screen);
     struct Entry { uint32_t va; RecompFn fn; };
     static const Entry table[] = {
         {0x00235100u, hle_D3D_SetLighting},

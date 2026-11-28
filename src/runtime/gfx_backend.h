@@ -10,6 +10,7 @@ enum class GfxBackendKind : int {
     Auto = 0,
     D3D11 = 1,
     OpenGL = 2,
+    Vulkan = 3,
 };
 
 struct RendererSettings {
@@ -43,6 +44,7 @@ struct GpuTextureObj {
     bool is_render_target = false;
     bool is_depth = false;
     bool dirty = true;
+    bool is_bink_frame = false;
 
     // D3D11 opaque handles (cast in d3d11_renderer.cpp)
     void* dx_tex = nullptr;
@@ -127,6 +129,9 @@ struct DrawStateSnapshot {
 
     uint32_t cull_mode = 3; // CCW
     uint32_t fill_mode = 3; // SOLID
+    float poly_offset_scale = 0.0f;
+    float poly_offset_bias = 0.0f;
+    bool  poly_offset_fill = false;
     bool alpha_test = false;
     uint32_t alpha_func = 8;
     float alpha_ref = 0.0f;
@@ -154,6 +159,7 @@ void gfx_shutdown();
 void gfx_resize(int width, int height);
 void gfx_set_fullscreen(bool fs);
 void gfx_release_context_for_game();
+void gfx_ensure_gl_current();
 bool gfx_is_opengl();
 RendererSettings& gfx_settings();
 double gfx_get_fps();
@@ -176,6 +182,7 @@ struct GfxTransformParams {
 
 GfxTransformParams gfx_compute_transform_params(const DrawStateSnapshot& st, float rt_w, float rt_h,
                                                 bool widescreen_cfg, bool unstretched_hud_cfg);
+bool gfx_upscale_texture(const DrawStateSnapshot& st, int stage);
 void gfx_pace_frame(int fps_cap);
 
 // Portable PNG writer (implemented via stb_image_write)

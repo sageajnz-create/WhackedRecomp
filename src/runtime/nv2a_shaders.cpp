@@ -72,15 +72,21 @@ DXGI_FORMAT vsdt_to_dxgi(uint8_t type) {
         case 0x22: return DXGI_FORMAT_R32G32_FLOAT;
         case 0x32: return DXGI_FORMAT_R32G32B32_FLOAT;
         case 0x42: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case 0x72: return DXGI_FORMAT_R32G32B32_FLOAT;      // D3DVSDT_FLOAT2H (x, y, w)
         case 0x40: return DXGI_FORMAT_B8G8R8A8_UNORM;     // D3DVSDT_D3DCOLOR
-        case 0x41: return DXGI_FORMAT_R8G8B8A8_UINT;      // UBYTE4
-        case 0x11: return DXGI_FORMAT_R16_SINT;
-        case 0x21: return DXGI_FORMAT_R16G16_SINT;
-        case 0x45: return DXGI_FORMAT_R16G16B16A16_SNORM; // NORMSHORT4
-        case 0x25: return DXGI_FORMAT_R16G16_SNORM;       // NORMSHORT2
-        case 0x44: return DXGI_FORMAT_R8G8B8A8_UNORM;     // PBYTE4
-        case 0x34: return DXGI_FORMAT_R8G8B8A8_UNORM;
-        case 0x16: return DXGI_FORMAT_R32_UINT;           // NORMPACKED3
+        case 0x11: return DXGI_FORMAT_R16_SINT;           // D3DVSDT_SHORT1
+        case 0x21: return DXGI_FORMAT_R16G16_SINT;        // D3DVSDT_SHORT2
+        case 0x31: return DXGI_FORMAT_R16G16B16A16_SINT;  // D3DVSDT_SHORT3
+        case 0x41: return DXGI_FORMAT_R16G16B16A16_SINT;  // D3DVSDT_SHORT4
+        case 0x15: return DXGI_FORMAT_R16_SNORM;          // D3DVSDT_NORMSHORT1
+        case 0x25: return DXGI_FORMAT_R16G16_SNORM;       // D3DVSDT_NORMSHORT2
+        case 0x35: return DXGI_FORMAT_R16G16B16A16_SNORM; // D3DVSDT_NORMSHORT3
+        case 0x45: return DXGI_FORMAT_R16G16B16A16_SNORM; // D3DVSDT_NORMSHORT4
+        case 0x14: return DXGI_FORMAT_R8_UNORM;           // D3DVSDT_PBYTE1
+        case 0x24: return DXGI_FORMAT_R8G8_UNORM;         // D3DVSDT_PBYTE2
+        case 0x34: return DXGI_FORMAT_R8G8B8A8_UNORM;     // D3DVSDT_PBYTE3
+        case 0x44: return DXGI_FORMAT_R8G8B8A8_UNORM;     // D3DVSDT_PBYTE4
+        case 0x16: return DXGI_FORMAT_R32_UINT;           // D3DVSDT_NORMPACKED3
         default:   return DXGI_FORMAT_R32G32B32A32_FLOAT;
     }
 }
@@ -88,7 +94,7 @@ DXGI_FORMAT vsdt_to_dxgi(uint8_t type) {
 std::string cache_file_path(const char* prefix, uint64_t key) {
     if (g_cache_dir.empty()) return {};
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%s_%016llX.dxbc", prefix, static_cast<unsigned long long>(key));
+    std::snprintf(buf, sizeof(buf), "%s_v2_%016llX.dxbc", prefix, static_cast<unsigned long long>(key));
     return (fs::path(g_cache_dir) / buf).string();
 }
 
@@ -192,13 +198,16 @@ std::string decl_vs_input_struct(const Nv2aVertexDecl& decl, bool glsl, bool* ou
     if (out_has_reg) std::memcpy(out_has_reg, has, 16);
 
     std::ostringstream ss;
+    auto is_sint_vsdt = [](uint8_t t) {
+        return t == 0x11 || t == 0x21 || t == 0x31 || t == 0x41;
+    };
     if (glsl) {
         for (int i = 0; i < 16; ++i) {
             if (!has[i]) continue;
             if (types[i] == 0x16) {
                 ss << "layout(location = " << i << ") in uint vin_v" << i << "_raw;\n";
-            } else if (types[i] == 0x41) {
-                ss << "layout(location = " << i << ") in uvec4 vin_v" << i << ";\n";
+            } else if (is_sint_vsdt(types[i])) {
+                ss << "layout(location = " << i << ") in ivec4 vin_v" << i << ";\n";
             } else {
                 ss << "layout(location = " << i << ") in vec4 vin_v" << i << ";\n";
             }
@@ -209,8 +218,8 @@ std::string decl_vs_input_struct(const Nv2aVertexDecl& decl, bool glsl, bool* ou
             if (!has[i]) continue;
             if (types[i] == 0x16) {
                 ss << "    uint v" << i << "_raw : TEXCOORD" << i << ";\n";
-            } else if (types[i] == 0x41) {
-                ss << "    uint4 v" << i << " : TEXCOORD" << i << ";\n";
+            } else if (is_sint_vsdt(types[i])) {
+                ss << "    int4 v" << i << " : TEXCOORD" << i << ";\n";
             } else {
                 ss << "    float4 v" << i << " : TEXCOORD" << i << ";\n";
             }
@@ -241,13 +250,21 @@ void emit_unpack_inputs(std::ostringstream& ss, const Nv2aVertexDecl& decl, cons
                << "        int z = int((p >> 22u) << 22u) >> 22;\n"
                << "        v" << i << " = " << f4 << "(float(x) / 1023.0, float(y) / 1023.0, float(z) / 511.0, 1.0);\n"
                << "    }\n";
-        } else if (etype == 0x41) {
-            ss << "    " << f4 << " v" << i << " = " << f4 << "(" << in_pre << i << ");\n";
+        } else if (etype == 0x72) {
+            ss << "    " << f4 << " v" << i << " = " << f4 << "(" << in_pre << i << ".xy, 0.0, " << in_pre << i << ".z);\n";
         } else {
-            ss << "    " << f4 << " v" << i << " = " << in_pre << i << ";\n";
-            if (etype == 0x32) ss << "    v" << i << ".w = 1.0;\n";
-            else if (etype == 0x22) ss << "    v" << i << ".zw = " << f2 << "(0.0, 1.0);\n";
-            else if (etype == 0x12) ss << "    v" << i << ".yzw = " << f3 << "(0.0, 0.0, 1.0);\n";
+            if (etype == 0x11 || etype == 0x21 || etype == 0x31 || etype == 0x41) {
+                ss << "    " << f4 << " v" << i << " = " << f4 << "(" << in_pre << i << ");\n";
+            } else {
+                ss << "    " << f4 << " v" << i << " = " << in_pre << i << ";\n";
+            }
+            if (etype == 0x32 || etype == 0x31 || etype == 0x34 || etype == 0x35) {
+                ss << "    v" << i << ".w = 1.0;\n";
+            } else if (etype == 0x22 || etype == 0x21 || etype == 0x24 || etype == 0x25) {
+                ss << "    v" << i << ".zw = " << f2 << "(0.0, 1.0);\n";
+            } else if (etype == 0x12 || etype == 0x11 || etype == 0x14 || etype == 0x15) {
+                ss << "    v" << i << ".yzw = " << f3 << "(0.0, 0.0, 1.0);\n";
+            }
         }
     }
 }
@@ -377,7 +394,7 @@ std::string generate_xvu_vs(const Nv2aVertexDecl& decl, const uint8_t* xvu_bytes
                 case 4u: ss << "    { float _v = max(abs((" << cc << ").w), 1e-10); float _r = " << rsq << "(_v); tmpILU = " << f4 << "(_r,_r,_r,_r); }\n"; break;
                 case 5u: ss << "    tmpILU = " << f4 << "(exp2((" << cc << ").w),0.0,0.0,0.0);\n"; break;
                 case 6u: ss << "    tmpILU = " << f4 << "(log2(max(abs((" << cc << ").w), 1e-10)),0.0,0.0,0.0);\n"; break;
-                case 7u: ss << "    { " << f4 << " _l = " << cc << "; float _m = 128.0; tmpILU = " << f4 << "(1.0, max(_l.x,0.0), (_l.x>0.0)?pow(max(_l.y,0.0), clamp(_l.w,-_m,_m)):0.0, 1.0); }\n"; break;
+                case 7u: ss << "    { " << f4 << " _l = " << cc << "; float _m = 128.0; float _e = clamp(_l.w,-_m,_m); float _s = (_l.x>0.0)?((_l.y>0.0)?pow(_l.y,_e):((_e==0.0)?1.0:0.0)):0.0; tmpILU = " << f4 << "(1.0, max(_l.x,0.0), _s, 1.0); }\n"; break;
                 default: break;
             }
         }
@@ -567,7 +584,7 @@ std::string generate_ff_vs(const Nv2aVertexDecl& decl, bool is_rhw, bool glsl) {
            << "                if (eyeFlags.x > 0.5 && ndl > 0.0) {\n"
            << "                    " << f3 << " V = normalize(-vp.xyz);\n"
            << "                    " << f3 << " H = normalize(L + V);\n"
-           << "                    specL += att * lightSpec[li].rgb * pow(max(dot(wn, H), 0.0), max(matSpecular.w, 1.0));\n"
+           << "                    specL += att * lightSpec[li].rgb * ((dot(wn, H) > 0.0) ? pow(dot(wn, H), max(matSpecular.w, 1.0)) : 0.0);\n"
            << "                }\n"
            << "            }\n"
            << "        }\n"
@@ -624,6 +641,77 @@ void emit_alpha_test_block(std::ostringstream& ss, const char* col, bool dynamic
     }
 }
 
+void emit_texture_upscaler(std::ostringstream& ss, bool glsl) {
+    if (glsl) {
+        ss << R"(
+#define UPSCALE_VEC2 vec2
+#define UPSCALE_VEC4 vec4
+#define TEXTURE_SAMPLE(uv) texture(image, uv)
+#define TEXTURE_SAMPLE_GRAD(uv, dx, dy) textureGrad(image, uv, dx, dy)
+#define UPSCALE_TAP(uv) textureLod(image, uv, 0.0)
+vec4 sample_upscaled(sampler2D image, vec2 uv, vec2 size) {
+    vec2 dx = dFdx(uv), dy = dFdy(uv);
+    if (size.x < 2.0)
+        return TEXTURE_SAMPLE(uv);
+)";
+    } else {
+        ss << R"(
+#define UPSCALE_VEC2 float2
+#define UPSCALE_VEC4 float4
+#define TEXTURE_SAMPLE(uv) image.Sample(filterMode, uv)
+#define TEXTURE_SAMPLE_GRAD(uv, dx, dy) image.SampleGrad(filterMode, uv, dx, dy)
+#define UPSCALE_TAP(uv) image.SampleLevel(filterMode, uv, 0.0)
+float4 sample_upscaled(Texture2D image, SamplerState filterMode, float2 uv, float2 size) {
+    float2 dx = ddx(uv), dy = ddy(uv);
+    if (size.x < 2.0)
+        return TEXTURE_SAMPLE(uv);
+)";
+    }
+    // Combine the middle two Catmull-Rom weights with bilinear hardware.
+    // The five-tap cross skips the small corner weights and renormalizes.
+    ss << R"(
+    UPSCALE_VEC2 footprint = max(abs(dx), abs(dy)) * size;
+    float magnification = 1.0 - smoothstep(0.65, 1.0, max(footprint.x, footprint.y));
+    if (magnification <= 0.0)
+        return TEXTURE_SAMPLE_GRAD(uv, dx, dy);
+
+    UPSCALE_VEC2 texel = uv * size - 0.5;
+    UPSCALE_VEC2 base = floor(texel) + 0.5;
+    UPSCALE_VEC2 f = texel - floor(texel);
+    UPSCALE_VEC2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    UPSCALE_VEC2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    UPSCALE_VEC2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    UPSCALE_VEC2 w3 = f * f * (-0.5 + 0.5 * f);
+    UPSCALE_VEC2 w12 = w1 + w2;
+    UPSCALE_VEC2 center = (base + w2 / w12) / size;
+    UPSCALE_VEC2 low = (base - 1.0) / size;
+    UPSCALE_VEC2 high = (base + 2.0) / size;
+
+    UPSCALE_VEC4 value = UPSCALE_TAP(center) * (w12.x * w12.y);
+    value += UPSCALE_TAP(UPSCALE_VEC2(low.x, center.y)) * (w0.x * w12.y);
+    value += UPSCALE_TAP(UPSCALE_VEC2(high.x, center.y)) * (w3.x * w12.y);
+    value += UPSCALE_TAP(UPSCALE_VEC2(center.x, low.y)) * (w12.x * w0.y);
+    value += UPSCALE_TAP(UPSCALE_VEC2(center.x, high.y)) * (w12.x * w3.y);
+    value /= w12.x * w12.y + (w0.x + w3.x) * w12.y + w12.x * (w0.y + w3.y);
+    value = clamp(value, 0.0, 1.0);
+    if (magnification >= 1.0)
+        return value;
+    return value * magnification + TEXTURE_SAMPLE_GRAD(uv, dx, dy) * (1.0 - magnification);
+}
+#undef UPSCALE_VEC2
+#undef UPSCALE_VEC4
+#undef TEXTURE_SAMPLE
+#undef TEXTURE_SAMPLE_GRAD
+#undef UPSCALE_TAP
+)";
+}
+
+std::string upscaled_texture_sample(bool glsl, int stage, const std::string& uv) {
+    const std::string slot = std::to_string(stage);
+    return "sample_upscaled(tex" + slot + (glsl ? "" : ", samp" + slot) +
+           ", " + uv + ", texScale[" + slot + "].zw)";
+}
+
 std::string generate_xpu_ps(const uint32_t psdef[60], bool glsl) {
     const uint32_t* alpha_in   = &psdef[0];
     uint32_t final_abcd        = psdef[8];
@@ -650,8 +738,7 @@ std::string generate_xpu_ps(const uint32_t psdef[60], bool glsl) {
            << "uniform sampler2D tex2; uniform sampler2D tex3;\n"
            << "layout(std140) uniform NV2APSConsts { vec4 pc[16]; vec4 alphaTest; vec4 fogColor; vec4 texScale[4]; };\n"
            << "in vec4 vs_oD0; in vec4 vs_oD1; in vec4 vs_oT0; in vec4 vs_oT1; in vec4 vs_oT2; in vec4 vs_oT3; in float vs_oFog;\n"
-           << "layout(location = 0) out vec4 FragColor;\n"
-           << "void main() {\n";
+           << "layout(location = 0) out vec4 FragColor;\n";
     } else {
         ss << "Texture2D tex0 : register(t0); Texture2D tex1 : register(t1);\n"
            << "Texture2D tex2 : register(t2); Texture2D tex3 : register(t3);\n"
@@ -663,29 +750,26 @@ std::string generate_xpu_ps(const uint32_t psdef[60], bool glsl) {
            << "    float4 v0   : COLOR0; float4 v1 : COLOR1;\n"
            << "    float4 tc0  : TEXCOORD0; float4 tc1 : TEXCOORD1; float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3;\n"
            << "    float  fog  : FOG;\n"
-           << "};\n"
-           << "float4 main(PS_IN pin) : SV_TARGET {\n";
+           << "};\n";
     }
+    emit_texture_upscaler(ss, glsl);
+    ss << (glsl ? "void main() {\n" : "float4 main(PS_IN pin) : SV_TARGET {\n");
     const char* p0 = glsl ? "vs_oD0" : "pin.v0";
     const char* p1 = glsl ? "vs_oD1" : "pin.v1";
     const char* pf = glsl ? "vs_oFog" : "pin.fog";
     auto tc_name = [&](int s) { return std::string(glsl ? "vs_oT" : "pin.tc") + std::to_string(s); };
-    auto sample2d = [&](int s, const std::string& uv) {
-        return glsl ? ("texture(tex" + std::to_string(s) + ", " + uv + ")")
-                    : ("tex" + std::to_string(s) + ".Sample(samp" + std::to_string(s) + ", " + uv + ")");
-    };
-
     ss << "    " << f4 << " t0 = " << f4 << "(0.0,0.0,0.0,0.0), t1 = " << f4 << "(0.0,0.0,0.0,0.0), t2 = " << f4 << "(0.0,0.0,0.0,0.0), t3 = " << f4 << "(0.0,0.0,0.0,0.0);\n";
     for (int s = 0; s < 4; ++s) {
         uint32_t tm = (tex_modes >> (s * 5)) & 0x1Fu;
         std::string tc = tc_name(s);
+        const std::string scale = " * texScale[" + std::to_string(s) + "].xy";
         if (tm == 1u || tm == 2u || tm == 3u) {
-            ss << "    t" << s << " = " << sample2d(s, "(" + tc + ".xy / max(" + tc + ".w, 1e-5)) * texScale[" + std::to_string(s) + "].xy") << ";\n";
-            ss << "    if (abs(" << tc << ".w - 1.0) < 1e-4) t" << s << " = " << sample2d(s, tc + ".xy * texScale[" + std::to_string(s) + "].xy") << ";\n";
+            const std::string w = "(abs(" + tc + ".w - 1.0) < 1e-4 ? 1.0 : max(" + tc + ".w, 1e-5))";
+            ss << "    t" << s << " = " << upscaled_texture_sample(glsl, s, "(" + tc + ".xy / " + w + ")" + scale) << ";\n";
         } else if (tm == 4u) {
             ss << "    t" << s << " = " << tc << ";\n";
         } else if (tm != 0u) {
-            ss << "    t" << s << " = " << sample2d(s, tc + ".xy * texScale[" + std::to_string(s) + "].xy") << ";\n";
+            ss << "    t" << s << " = " << upscaled_texture_sample(glsl, s, tc + ".xy" + scale) << ";\n";
         }
     }
     ss << "    " << f4 << " r0 = " << f4 << "(t0.rgb, t0.a);\n"
@@ -891,14 +975,18 @@ std::string generate_ff_ps(const Nv2aFFPSKey& cfg, bool glsl) {
         }
     };
 
+    emit_texture_upscaler(ss, glsl);
     ss << (glsl ? "void main() {\n" : "float4 main(PS_IN pin) : SV_TARGET {\n");
     for (int s = 0; s < 4; ++s) {
         if (!(cfg.tex_bound_mask & (1 << s))) continue;
         std::string tc = std::string(glsl ? "vs_oT" : "pin.tc") + std::to_string(s);
         bool cube = (cfg.tex_is_cube_mask & (1 << s)) != 0;
         std::string coord = cube ? (tc + ".xyz") : (tc + ".xy * texScale[" + std::to_string(s) + "].xy");
-        std::string samp = glsl ? ("texture(tex" + std::to_string(s) + ", " + coord + ")")
-                                : ("tex" + std::to_string(s) + ".Sample(samp" + std::to_string(s) + ", " + coord + ")");
+        std::string samp = upscaled_texture_sample(glsl, s, coord);
+        if (cube) {
+            samp = glsl ? ("texture(tex" + std::to_string(s) + ", " + coord + ")")
+                        : ("tex" + std::to_string(s) + ".Sample(samp" + std::to_string(s) + ", " + coord + ")");
+        }
         ss << "    " << f4 << " t" << s << " = " << samp << ";\n";
     }
     ss << "    " << f4 << " cur = " << p0 << ";\n";
@@ -1152,7 +1240,7 @@ const Nv2aCompiledVS* nv2a_get_ff_vs(const Nv2aVertexDecl& decl) {
 
 const Nv2aCompiledPS* nv2a_get_xpu_ps(const uint32_t psdef[60]) {
     if (!psdef) return nullptr;
-    uint64_t key = fnv1a_bytes(psdef, 240, 0x58505532ull);
+    uint64_t key = fnv1a_bytes(psdef, 240, 0x58505533ull);
 
     std::lock_guard<std::mutex> lk(g_sh_mtx);
     auto it = g_ps_cache.find(key);
@@ -1187,7 +1275,7 @@ const Nv2aCompiledPS* nv2a_get_xpu_ps(const uint32_t psdef[60]) {
 }
 
 const Nv2aCompiledPS* nv2a_get_ff_ps(const Nv2aFFPSKey& cfg) {
-    uint64_t key = fnv1a_bytes(&cfg, sizeof(cfg), 0x46465054ull);
+    uint64_t key = fnv1a_bytes(&cfg, sizeof(cfg), 0x46465055ull);
 
     std::lock_guard<std::mutex> lk(g_sh_mtx);
     auto it = g_ps_cache.find(key);

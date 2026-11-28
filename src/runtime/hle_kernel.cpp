@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -74,12 +75,21 @@ struct HostSyncObj {
     std::thread::id owner{};
     int32_t depth = 0;
 };
-using HostSync = HostSyncObj*;
+using HostSync = std::shared_ptr<HostSyncObj>;
 using HostFile = int;
 constexpr HostFile HOST_INVALID_FILE = -1;
 std::mutex g_sync_mtx;
 std::condition_variable g_sync_cv;
 #endif
+
+std::atomic<bool> g_krnl_shutting_down{false};
+std::condition_variable g_thr_exit_cv;
+
+inline void check_guest_shutdown() {
+    if (g_krnl_shutting_down.load(std::memory_order_acquire)) {
+        throw GuestPowerOff{};
+    }
+}
 
 uint64_t host_ticks_ms() {
     static const auto t0 = std::chrono::steady_clock::now();
@@ -89,8 +99,20 @@ uint64_t host_ticks_ms() {
 }
 
 void host_sleep_ms(uint32_t ms) {
-    if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    else std::this_thread::yield();
+    if (ms == 0) { std::this_thread::yield(); return; }
+#ifdef _WIN32
+    uint32_t rem = ms;
+    while (rem > 0 && !g_krnl_shutting_down.load(std::memory_order_acquire)) {
+        uint32_t step = std::min(rem, 50u);
+        std::this_thread::sleep_for(std::chrono::milliseconds(step));
+        rem -= step;
+    }
+#else
+    std::unique_lock<std::mutex> lk(g_sync_mtx);
+    g_sync_cv.wait_for(lk, std::chrono::milliseconds(ms), []() {
+        return g_krnl_shutting_down.load(std::memory_order_acquire);
+    });
+#endif
 }
 
 int ci_strcmp(const char* a, const char* b) {
@@ -113,7 +135,7 @@ HostSync host_create_event(bool manual_reset, bool initial_state) {
 #ifdef _WIN32
     return CreateEventA(nullptr, manual_reset ? TRUE : FALSE, initial_state ? TRUE : FALSE, nullptr);
 #else
-    auto* s = new HostSyncObj();
+    auto s = std::make_shared<HostSyncObj>();
     s->kind = HostSyncObj::Kind::Event;
     s->manual_reset = manual_reset;
     s->signaled = initial_state;
@@ -125,7 +147,7 @@ HostSync host_create_semaphore(int32_t init, int32_t maxc) {
 #ifdef _WIN32
     return CreateSemaphoreA(nullptr, init, maxc, nullptr);
 #else
-    auto* s = new HostSyncObj();
+    auto s = std::make_shared<HostSyncObj>();
     s->kind = HostSyncObj::Kind::Semaphore;
     s->count = init;
     s->max_count = maxc;
@@ -137,7 +159,7 @@ HostSync host_create_mutex(bool initial_owner) {
 #ifdef _WIN32
     return CreateMutexA(nullptr, initial_owner ? TRUE : FALSE, nullptr);
 #else
-    auto* s = new HostSyncObj();
+    auto s = std::make_shared<HostSyncObj>();
     s->kind = HostSyncObj::Kind::Mutant;
     if (initial_owner) {
         s->owner = std::this_thread::get_id();
@@ -147,7 +169,7 @@ HostSync host_create_mutex(bool initial_owner) {
 #endif
 }
 
-void host_set_event(HostSync s) {
+void host_set_event(const HostSync& s) {
     if (!s) return;
 #ifdef _WIN32
     SetEvent(s);
@@ -158,7 +180,7 @@ void host_set_event(HostSync s) {
 #endif
 }
 
-void host_reset_event(HostSync s) {
+void host_reset_event(const HostSync& s) {
     if (!s) return;
 #ifdef _WIN32
     ResetEvent(s);
@@ -168,7 +190,7 @@ void host_reset_event(HostSync s) {
 #endif
 }
 
-void host_pulse_event(HostSync s) {
+void host_pulse_event(const HostSync& s) {
     if (!s) return;
 #ifdef _WIN32
     PulseEvent(s);
@@ -180,7 +202,7 @@ void host_pulse_event(HostSync s) {
 #endif
 }
 
-void host_release_semaphore(HostSync s, int32_t cnt, int32_t* prev) {
+void host_release_semaphore(const HostSync& s, int32_t cnt, int32_t* prev) {
     if (!s) return;
 #ifdef _WIN32
     LONG p = 0;
@@ -194,7 +216,7 @@ void host_release_semaphore(HostSync s, int32_t cnt, int32_t* prev) {
 #endif
 }
 
-void host_release_mutex(HostSync s) {
+void host_release_mutex(const HostSync& s) {
     if (!s) return;
 #ifdef _WIN32
     ReleaseMutex(s);
@@ -209,18 +231,18 @@ void host_release_mutex(HostSync s) {
 #endif
 }
 
-void host_close_sync(HostSync s) {
+void host_close_sync(HostSync& s) {
     if (!s) return;
 #ifdef _WIN32
     CloseHandle(s);
+    s = nullptr;
 #else
-    // Intentionally kept lightweight; could refcount if needed
-    delete s;
+    s.reset();
 #endif
 }
 
 #ifndef _WIN32
-bool sync_is_ready(HostSync s) {
+bool sync_is_ready(const HostSync& s) {
     if (!s) return true;
     switch (s->kind) {
         case HostSyncObj::Kind::Event: return s->signaled;
@@ -231,7 +253,7 @@ bool sync_is_ready(HostSync s) {
     return true;
 }
 
-void sync_consume(HostSync s) {
+void sync_consume(const HostSync& s) {
     if (!s) return;
     switch (s->kind) {
         case HostSyncObj::Kind::Event:
@@ -249,14 +271,28 @@ void sync_consume(HostSync s) {
 #endif
 
 // Returns 0..count-1 or 0x102u (WAIT_TIMEOUT)
-uint32_t host_wait_single(HostSync s, uint32_t ms) {
+uint32_t host_wait_single(const HostSync& s, uint32_t ms) {
     if (!s) return 0u;
 #ifdef _WIN32
-    DWORD w = WaitForSingleObject(s, ms);
-    return (w == WAIT_TIMEOUT) ? 0x102u : 0u;
+    if (ms == 0) {
+        return (WaitForSingleObject(s, 0) == WAIT_TIMEOUT) ? 0x102u : 0u;
+    }
+    uint32_t rem = ms;
+    while (!g_krnl_shutting_down.load(std::memory_order_acquire)) {
+        uint32_t step = (ms == INFINITE) ? 50u : std::min(rem, 50u);
+        DWORD w = WaitForSingleObject(s, step);
+        if (w != WAIT_TIMEOUT) return 0u;
+        if (ms != INFINITE) {
+            if (rem <= step) return 0x102u;
+            rem -= step;
+        }
+    }
+    return 0u;
 #else
     std::unique_lock<std::mutex> lk(g_sync_mtx);
-    auto pred = [&]() { return sync_is_ready(s); };
+    auto pred = [&]() {
+        return g_krnl_shutting_down.load(std::memory_order_acquire) || sync_is_ready(s);
+    };
     if (ms == INFINITE) {
         g_sync_cv.wait(lk, pred);
     } else if (ms == 0) {
@@ -264,6 +300,7 @@ uint32_t host_wait_single(HostSync s, uint32_t ms) {
     } else {
         if (!g_sync_cv.wait_for(lk, std::chrono::milliseconds(ms), pred)) return 0x102u;
     }
+    if (g_krnl_shutting_down.load(std::memory_order_acquire)) return 0u;
     sync_consume(s);
     return 0u;
 #endif
@@ -272,14 +309,31 @@ uint32_t host_wait_single(HostSync s, uint32_t ms) {
 uint32_t host_wait_multiple(uint32_t count, const HostSync* objs, bool wait_all, uint32_t ms) {
     if (count == 0) return 0u;
 #ifdef _WIN32
-    DWORD w = WaitForMultipleObjects(count, objs, wait_all ? TRUE : FALSE, ms);
-    if (w == WAIT_TIMEOUT) return 0x102u;
-    if (w >= WAIT_OBJECT_0 && w < WAIT_OBJECT_0 + count) return w - WAIT_OBJECT_0;
+    if (ms == 0) {
+        DWORD w = WaitForMultipleObjects(count, objs, wait_all ? TRUE : FALSE, 0);
+        if (w == WAIT_TIMEOUT) return 0x102u;
+        if (w >= WAIT_OBJECT_0 && w < WAIT_OBJECT_0 + count) return w - WAIT_OBJECT_0;
+        return 0u;
+    }
+    uint32_t rem = ms;
+    while (!g_krnl_shutting_down.load(std::memory_order_acquire)) {
+        uint32_t step = (ms == INFINITE) ? 50u : std::min(rem, 50u);
+        DWORD w = WaitForMultipleObjects(count, objs, wait_all ? TRUE : FALSE, step);
+        if (w != WAIT_TIMEOUT) {
+            if (w >= WAIT_OBJECT_0 && w < WAIT_OBJECT_0 + count) return w - WAIT_OBJECT_0;
+            return 0u;
+        }
+        if (ms != INFINITE) {
+            if (rem <= step) return 0x102u;
+            rem -= step;
+        }
+    }
     return 0u;
 #else
     std::unique_lock<std::mutex> lk(g_sync_mtx);
     int hit = -1;
     auto pred = [&]() {
+        if (g_krnl_shutting_down.load(std::memory_order_acquire)) return true;
         if (wait_all) {
             for (uint32_t i = 0; i < count; ++i) {
                 if (!sync_is_ready(objs[i])) return false;
@@ -299,6 +353,7 @@ uint32_t host_wait_multiple(uint32_t count, const HostSync* objs, bool wait_all,
     } else {
         if (!g_sync_cv.wait_for(lk, std::chrono::milliseconds(ms), pred)) return 0x102u;
     }
+    if (g_krnl_shutting_down.load(std::memory_order_acquire)) return 0u;
     if (wait_all) {
         for (uint32_t i = 0; i < count; ++i) sync_consume(objs[i]);
         return 0u;
@@ -362,6 +417,12 @@ KernelObj* get_handle(uint32_t h) {
     std::lock_guard<std::mutex> lk(g_krnl_mtx);
     auto it = g_handles.find(h);
     return it != g_handles.end() ? it->second : nullptr;
+}
+
+HostSync get_handle_sync(uint32_t h) {
+    std::lock_guard<std::mutex> lk(g_krnl_mtx);
+    auto it = g_handles.find(h);
+    return (it != g_handles.end() && it->second) ? it->second->sync_handle : HostSync{};
 }
 
 std::recursive_mutex* get_or_create_cs(uint32_t cs_va) {
@@ -485,8 +546,8 @@ struct GuestThreadState {
 };
 static std::mutex g_diag_mtx;
 static std::vector<GuestThreadState*> g_guest_threads;
-static std::unordered_map<uint32_t, ThreadControl*> g_thr_by_handle;
-static std::unordered_map<uint32_t, ThreadControl*> g_thr_by_tid;
+static std::unordered_map<uint32_t, std::shared_ptr<ThreadControl>> g_thr_by_handle;
+static std::unordered_map<uint32_t, std::shared_ptr<ThreadControl>> g_thr_by_tid;
 static thread_local GuestThreadState* tl_thread_state = nullptr;
 static thread_local ThreadControl* tl_self_ctrl = nullptr;
 static thread_local uint32_t tl_tid = 0;
@@ -494,14 +555,17 @@ static HleTraceEntry g_trace_ring[64]{};
 static uint32_t g_trace_write_idx = 0;
 static std::atomic<uint64_t> g_kernel_tick_activity{0};
 static void (*g_log_sink)(const char*) = nullptr;
+static void (*g_thread_exit_hook)() = nullptr;
 
 static void emit_log_sink(const char* msg) {
     if (g_log_sink && msg) g_log_sink(msg);
 }
 
 static void wait_if_self_suspended() {
+    check_guest_shutdown();
     ThreadControl* tc = tl_self_ctrl;
     while (tc && tc->suspend_cnt.load(std::memory_order_acquire) > 0) {
+        check_guest_shutdown();
         if (tl_thread_state) {
             tl_thread_state->wait_op = "Suspended";
             tl_thread_state->wait_arg = tc->handle;
@@ -509,6 +573,7 @@ static void wait_if_self_suspended() {
         }
         host_wait_single(tc->resume_ev, INFINITE);
         if (tl_thread_state) tl_thread_state->wait_op = nullptr;
+        check_guest_shutdown();
     }
 }
 
@@ -525,6 +590,9 @@ static void record_hle_op(const CpuContext& ctx, const char* op, uint32_t a0 = 0
 } // namespace
 void hle_set_log_sink(void (*sink)(const char*)) {
     g_log_sink = sink;
+}
+void hle_set_thread_exit_hook(void (*hook)()) {
+    g_thread_exit_hook = hook;
 }
 void hle_log_note(const char* fmt, ...) {
     char buf[1024]{};
@@ -616,10 +684,10 @@ void hle_NtCreateEvent(CpuContext& ctx) {
 void hle_NtSetEvent(CpuContext& ctx) {
     uint32_t h = hle_arg(ctx, 0);
     uint32_t prev_ptr = hle_arg(ctx, 1);
-    auto* obj = get_handle(h);
-    if (obj && obj->sync_handle) {
+    HostSync sync = get_handle_sync(h);
+    if (sync) {
         if (prev_ptr) wr32(prev_ptr, 0);
-        host_set_event(obj->sync_handle);
+        host_set_event(sync);
         hle_ret_u32(ctx, STATUS_SUCCESS_XB, 8);
     } else {
         hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 8);
@@ -628,9 +696,9 @@ void hle_NtSetEvent(CpuContext& ctx) {
 
 void hle_NtClearEvent(CpuContext& ctx) {
     uint32_t h = hle_arg(ctx, 0);
-    auto* obj = get_handle(h);
-    if (obj && obj->sync_handle) {
-        host_reset_event(obj->sync_handle);
+    HostSync sync = get_handle_sync(h);
+    if (sync) {
+        host_reset_event(sync);
         hle_ret_u32(ctx, STATUS_SUCCESS_XB, 4);
     } else {
         hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 4);
@@ -640,10 +708,10 @@ void hle_NtClearEvent(CpuContext& ctx) {
 void hle_NtPulseEvent(CpuContext& ctx) {
     uint32_t h = hle_arg(ctx, 0);
     uint32_t prev_ptr = hle_arg(ctx, 1);
-    auto* obj = get_handle(h);
-    if (obj && obj->sync_handle) {
+    HostSync sync = get_handle_sync(h);
+    if (sync) {
         if (prev_ptr) wr32(prev_ptr, 0);
-        host_pulse_event(obj->sync_handle);
+        host_pulse_event(sync);
         hle_ret_u32(ctx, STATUS_SUCCESS_XB, 8);
     } else {
         hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 8);
@@ -666,10 +734,10 @@ void hle_NtReleaseSemaphore(CpuContext& ctx) {
     uint32_t h = hle_arg(ctx, 0);
     int32_t cnt = static_cast<int32_t>(hle_arg(ctx, 1));
     uint32_t prev_ptr = hle_arg(ctx, 2);
-    auto* obj = get_handle(h);
+    HostSync sync = get_handle_sync(h);
     int32_t prev = 0;
-    if (obj && obj->sync_handle) {
-        host_release_semaphore(obj->sync_handle, cnt, &prev);
+    if (sync) {
+        host_release_semaphore(sync, cnt, &prev);
         if (prev_ptr) wr32(prev_ptr, static_cast<uint32_t>(prev));
         hle_ret_u32(ctx, STATUS_SUCCESS_XB, 12);
     } else {
@@ -690,9 +758,9 @@ void hle_NtCreateMutant(CpuContext& ctx) {
 void hle_NtReleaseMutant(CpuContext& ctx) {
     uint32_t h = hle_arg(ctx, 0);
     uint32_t prev_ptr = hle_arg(ctx, 1);
-    auto* obj = get_handle(h);
-    if (obj && obj->sync_handle) {
-        host_release_mutex(obj->sync_handle);
+    HostSync sync = get_handle_sync(h);
+    if (sync) {
+        host_release_mutex(sync);
         if (prev_ptr) wr32(prev_ptr, 0);
         hle_ret_u32(ctx, STATUS_SUCCESS_XB, 8);
     } else {
@@ -708,68 +776,79 @@ uint32_t timeout_ptr_to_ms(uint32_t to_va) {
 }
 
 void hle_NtWaitForSingleObjectEx(CpuContext& ctx) {
+    check_guest_shutdown();
     uint32_t h = hle_arg(ctx, 0);
     uint32_t to_va = hle_arg(ctx, 3);
-    auto* obj = get_handle(h);
+    HostSync sync = get_handle_sync(h);
     uint32_t ms = timeout_ptr_to_ms(to_va);
-    if (!obj || !obj->sync_handle) {
+    if (!sync) {
         hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 16);
         return;
     }
     record_hle_op(ctx, "NtWaitSingleEx", h, ms);
     if (tl_thread_state) { tl_thread_state->wait_op = "NtWaitSingleEx"; tl_thread_state->wait_arg = h; tl_thread_state->wait_ms = ms; }
-    uint32_t w = host_wait_single(obj->sync_handle, ms);
+    uint32_t w = host_wait_single(sync, ms);
     if (tl_thread_state) tl_thread_state->wait_op = nullptr;
+    check_guest_shutdown();
     hle_ret_u32(ctx, (w == 0x102u) ? 0x00000102u : STATUS_SUCCESS_XB, 16);
 }
 
 void hle_NtWaitForSingleObject(CpuContext& ctx) {
+    check_guest_shutdown();
     uint32_t h = hle_arg(ctx, 0);
     uint32_t to_va = hle_arg(ctx, 2);
-    auto* obj = get_handle(h);
+    HostSync sync = get_handle_sync(h);
     uint32_t ms = timeout_ptr_to_ms(to_va);
-    if (!obj || !obj->sync_handle) {
+    if (!sync) {
         hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 12);
         return;
     }
     record_hle_op(ctx, "NtWaitSingle", h, ms);
     if (tl_thread_state) { tl_thread_state->wait_op = "NtWaitSingle"; tl_thread_state->wait_arg = h; tl_thread_state->wait_ms = ms; }
-    uint32_t w = host_wait_single(obj->sync_handle, ms);
+    uint32_t w = host_wait_single(sync, ms);
     if (tl_thread_state) tl_thread_state->wait_op = nullptr;
+    check_guest_shutdown();
     hle_ret_u32(ctx, (w == 0x102u) ? 0x00000102u : STATUS_SUCCESS_XB, 12);
 }
 
 void hle_NtWaitForMultipleObjectsEx(CpuContext& ctx) {
+    check_guest_shutdown();
     uint32_t count = hle_arg(ctx, 0);
     uint32_t handles_va = hle_arg(ctx, 1);
     uint32_t wait_type = hle_arg(ctx, 2); // 0=All, 1=Any
     uint32_t to_va = hle_arg(ctx, 4);
     std::vector<HostSync> wh(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        auto* o = get_handle(rd32(handles_va + i * 4u));
-        wh[i] = o ? o->sync_handle : nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_krnl_mtx);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto it = g_handles.find(rd32(handles_va + i * 4u));
+            wh[i] = (it != g_handles.end() && it->second) ? it->second->sync_handle : HostSync{};
+        }
     }
     uint32_t ms = timeout_ptr_to_ms(to_va);
     record_hle_op(ctx, "NtWaitMultiEx", count, ms);
     if (tl_thread_state) { tl_thread_state->wait_op = "NtWaitMultiEx"; tl_thread_state->wait_arg = count; tl_thread_state->wait_ms = ms; }
     uint32_t w = host_wait_multiple(count, wh.data(), wait_type == 0, ms);
     if (tl_thread_state) tl_thread_state->wait_op = nullptr;
+    check_guest_shutdown();
     hle_ret_u32(ctx, w, 20);
 }
 
 void hle_NtSignalAndWaitForSingleObjectEx(CpuContext& ctx) {
+    check_guest_shutdown();
     uint32_t sig_h = hle_arg(ctx, 0);
     uint32_t wait_h = hle_arg(ctx, 1);
     uint32_t to_va = hle_arg(ctx, 3);
-    auto* so = get_handle(sig_h);
-    auto* wo = get_handle(wait_h);
-    if (so && so->sync_handle) host_set_event(so->sync_handle);
-    if (!wo || !wo->sync_handle) { hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 16); return; }
+    HostSync sig_sync = get_handle_sync(sig_h);
+    HostSync wait_sync = get_handle_sync(wait_h);
+    if (sig_sync) host_set_event(sig_sync);
+    if (!wait_sync) { hle_ret_u32(ctx, STATUS_INVALID_HANDLE_XB, 16); return; }
     uint32_t ms = timeout_ptr_to_ms(to_va);
     record_hle_op(ctx, "NtSignalAndWait", sig_h, wait_h);
     if (tl_thread_state) { tl_thread_state->wait_op = "NtSignalAndWait"; tl_thread_state->wait_arg = wait_h; tl_thread_state->wait_ms = ms; }
-    uint32_t w = host_wait_single(wo->sync_handle, ms);
+    uint32_t w = host_wait_single(wait_sync, ms);
     if (tl_thread_state) tl_thread_state->wait_op = nullptr;
+    check_guest_shutdown();
     hle_ret_u32(ctx, (w == 0x102u) ? 0x00000102u : STATUS_SUCCESS_XB, 16);
 }
 
@@ -783,6 +862,7 @@ void hle_KeSetEvent(CpuContext& ctx) {
 }
 
 void hle_KeWaitForSingleObject(CpuContext& ctx) {
+    check_guest_shutdown();
     uint32_t kobj_va = hle_arg(ctx, 0);
     uint32_t to_va = hle_arg(ctx, 4);
     HostSync ev = get_or_create_kobj_event(kobj_va, true, false);
@@ -791,10 +871,12 @@ void hle_KeWaitForSingleObject(CpuContext& ctx) {
     if (tl_thread_state) { tl_thread_state->wait_op = "KeWaitSingle"; tl_thread_state->wait_arg = kobj_va; tl_thread_state->wait_ms = ms; }
     uint32_t w = host_wait_single(ev, ms);
     if (tl_thread_state) tl_thread_state->wait_op = nullptr;
+    check_guest_shutdown();
     hle_ret_u32(ctx, (w == 0x102u) ? 0x00000102u : STATUS_SUCCESS_XB, 20);
 }
 
 void hle_KeWaitForMultipleObjects(CpuContext& ctx) {
+    check_guest_shutdown();
     uint32_t count = hle_arg(ctx, 0);
     uint32_t objs_va = hle_arg(ctx, 1);
     uint32_t wait_type = hle_arg(ctx, 2);
@@ -806,6 +888,7 @@ void hle_KeWaitForMultipleObjects(CpuContext& ctx) {
     if (tl_thread_state) { tl_thread_state->wait_op = "KeWaitMulti"; tl_thread_state->wait_arg = count; tl_thread_state->wait_ms = ms; }
     uint32_t w = host_wait_multiple(count, wh.data(), wait_type == 0, ms);
     if (tl_thread_state) tl_thread_state->wait_op = nullptr;
+    check_guest_shutdown();
     hle_ret_u32(ctx, w, 28);
 }
 
@@ -838,24 +921,26 @@ void hle_NtCreateTimer(CpuContext& ctx) {
 }
 void hle_NtSetTimerEx(CpuContext& ctx) {
     uint32_t h = hle_arg(ctx, 0);
-    if (auto* o = get_handle(h); o && o->sync_handle) host_set_event(o->sync_handle);
+    if (HostSync s = get_handle_sync(h)) host_set_event(s);
     hle_ret_u32(ctx, STATUS_SUCCESS_XB, 28);
 }
 void hle_NtCancelTimer(CpuContext& ctx) {
     uint32_t h = hle_arg(ctx, 0);
-    if (auto* o = get_handle(h); o && o->sync_handle) host_reset_event(o->sync_handle);
+    if (HostSync s = get_handle_sync(h)) host_reset_event(s);
     hle_ret_u32(ctx, STATUS_SUCCESS_XB, 8);
 }
 
 void hle_KeDelayExecutionThread(CpuContext& ctx) {
+    check_guest_shutdown();
     uint32_t to_va = hle_arg(ctx, 2);
     uint32_t ms = to_va ? timeout_ptr_to_ms(to_va) : 0;
     host_sleep_ms(ms);
     wait_if_self_suspended();
+    check_guest_shutdown();
     hle_ret_u32(ctx, STATUS_SUCCESS_XB, 12);
 }
-void hle_NtYieldExecution(CpuContext& ctx) { std::this_thread::yield(); wait_if_self_suspended(); hle_ret_u32(ctx, 0, 0); }
-void hle_KeStallExecutionProcessor(CpuContext& ctx) { std::this_thread::yield(); hle_ret(ctx, 4); }
+void hle_NtYieldExecution(CpuContext& ctx) { check_guest_shutdown(); std::this_thread::yield(); wait_if_self_suspended(); hle_ret_u32(ctx, 0, 0); }
+void hle_KeStallExecutionProcessor(CpuContext& ctx) { check_guest_shutdown(); std::this_thread::yield(); hle_ret(ctx, 4); }
 void hle_KfRaiseIrql(CpuContext& ctx) { hle_ret_u32(ctx, 0, 4); }
 void hle_KfLowerIrql(CpuContext& ctx) {
     // __fastcall in x86 kernel: cl = NewIrql, 0 stack args!
@@ -1709,7 +1794,7 @@ void hle_PsCreateSystemThreadEx(CpuContext& ctx) {
     if (ph) wr32(ph, h);
     if (ptid) wr32(ptid, tid);
 
-    auto* tc = new ThreadControl();
+    auto tc = std::make_shared<ThreadControl>();
     tc->suspend_cnt.store(suspended ? 1 : 0, std::memory_order_release);
     tc->resume_ev = host_create_event(true, !suspended);
     tc->tid = tid;
@@ -1721,36 +1806,42 @@ void hle_PsCreateSystemThreadEx(CpuContext& ctx) {
     }
 
     HostSync done_ev = obj->sync_handle;
-    obj->thr = new std::thread([=]() {
+    std::thread([=]() {
         CpuContext tctx{};
         tctx.fs_base = teb_va;
         tctx.esp = stack_base + stack_sz - 64u;
         tl_tid = tid;
-        tl_self_ctrl = tc;
+        tl_self_ctrl = tc.get();
         GuestThreadState gts{};
         gts.tid = tid;
         gts.ctx = &tctx;
-        gts.ctrl = tc;
+        gts.ctrl = tc.get();
         tl_thread_state = &gts;
         {
             std::lock_guard<std::mutex> dlk(g_diag_mtx);
             g_guest_threads.push_back(&gts);
         }
-        wait_if_self_suspended();
-        // XapiThreadStartup(StartContext1, StartContext2) stdcall
-        tctx.push32(start_c2);
-        tctx.push32(start_c1);
-        tctx.push32(0xDEAD1001u);
-        if (g_hle_trace) {
-            std::printf("[THR %u] Starting routine=0x%08X ctx1=0x%08X ctx2=0x%08X susp=%u stack=0x%08X\n",
-                        tid, start_fn, start_c1, start_c2, suspended, tctx.esp);
-        }
-        record_hle_op(tctx, "ThreadStart", start_fn, suspended);
         try {
+            wait_if_self_suspended();
+            // XapiThreadStartup(StartContext1, StartContext2) stdcall
+            tctx.push32(start_c2);
+            tctx.push32(start_c1);
+            tctx.push32(0xDEAD1001u);
+            if (g_hle_trace) {
+                std::printf("[THR %u] Starting routine=0x%08X ctx1=0x%08X ctx2=0x%08X susp=%u stack=0x%08X\n",
+                            tid, start_fn, start_c1, start_c2, suspended, tctx.esp);
+            }
+            record_hle_op(tctx, "ThreadStart", start_fn, suspended);
             recomp_dispatch_call(tctx, start_fn);
         } catch (const GuestPowerOff&) {
             app_request_quit();
         }
+        if (g_thread_exit_hook) g_thread_exit_hook();
+        tl_thread_state = nullptr;
+        tl_self_ctrl = nullptr;
+        xbox_free_teb(teb_va);
+        xbox_guest_free(stack_base);
+        host_set_event(done_ev);
         {
             std::lock_guard<std::mutex> dlk(g_diag_mtx);
             g_guest_threads.erase(
@@ -1759,13 +1850,8 @@ void hle_PsCreateSystemThreadEx(CpuContext& ctx) {
             g_thr_by_handle.erase(h);
             g_thr_by_tid.erase(tid);
         }
-        tl_thread_state = nullptr;
-        tl_self_ctrl = nullptr;
-        xbox_free_teb(teb_va);
-        xbox_guest_free(stack_base);
-        host_set_event(done_ev);
-    });
-    obj->thr->detach();
+        g_thr_exit_cv.notify_all();
+    }).detach();
     hle_ret_u32(ctx, STATUS_SUCCESS_XB, 40);
 }
 
@@ -2044,15 +2130,20 @@ DEF_STUB(NtRemoveIoCompletion, 0, 20)
 DEF_STUB(NtQueryDirectoryFile_unused, 0, 40)
 DEF_STUB(NtQueueApcThread, 0, 20)
 static void hle_NtSuspendThread(CpuContext& ctx) {
+    check_guest_shutdown();
     uint32_t h = hle_arg(ctx, 0);
     uint32_t pprev = hle_arg(ctx, 1);
     ThreadControl* tc = nullptr;
+    std::shared_ptr<ThreadControl> owned_tc;
     int32_t prev = 0;
     {
         std::lock_guard<std::mutex> lk(g_diag_mtx);
         if (h == 0xFFFFFFFEu) tc = tl_self_ctrl;
-        else if (auto it = g_thr_by_handle.find(h); it != g_thr_by_handle.end()) tc = it->second;
-        if (tc) {
+        else if (auto it = g_thr_by_handle.find(h); it != g_thr_by_handle.end()) {
+            owned_tc = it->second;
+            tc = owned_tc.get();
+        }
+        if (tc && !g_krnl_shutting_down.load(std::memory_order_acquire)) {
             prev = tc->suspend_cnt.load(std::memory_order_relaxed);
             tc->suspend_cnt.store(prev + 1, std::memory_order_release);
             host_reset_event(tc->resume_ev);
@@ -2073,8 +2164,12 @@ static void hle_NtResumeThread(CpuContext& ctx) {
     {
         std::lock_guard<std::mutex> lk(g_diag_mtx);
         ThreadControl* tc = nullptr;
+        std::shared_ptr<ThreadControl> owned_tc;
         if (h == 0xFFFFFFFEu) tc = tl_self_ctrl;
-        else if (auto it = g_thr_by_handle.find(h); it != g_thr_by_handle.end()) tc = it->second;
+        else if (auto it = g_thr_by_handle.find(h); it != g_thr_by_handle.end()) {
+            owned_tc = it->second;
+            tc = owned_tc.get();
+        }
         if (tc) {
             prev = tc->suspend_cnt.load(std::memory_order_relaxed);
             if (prev > 0) {
@@ -2140,18 +2235,49 @@ void hle_kernel_update_ticks() {
 }
 
 void hle_kernel_signal_handle(uint32_t handle) {
-    auto* obj = get_handle(handle);
-    if (obj && obj->sync_handle) {
-        host_set_event(obj->sync_handle);
+    if (HostSync s = get_handle_sync(handle)) {
+        host_set_event(s);
     }
 }
 
+void hle_kernel_request_shutdown() {
+    g_krnl_shutting_down.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> dlk(g_diag_mtx);
+        for (auto& kv : g_thr_by_handle) {
+            if (kv.second) {
+                kv.second->suspend_cnt.store(0, std::memory_order_release);
+                host_set_event(kv.second->resume_ev);
+            }
+        }
+    }
+#ifndef _WIN32
+    g_sync_cv.notify_all();
+#endif
+}
+
+bool hle_kernel_is_shutting_down() {
+    return g_krnl_shutting_down.load(std::memory_order_acquire);
+}
+
+bool hle_kernel_wait_for_guest_threads(uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lk(g_diag_mtx);
+    return g_thr_exit_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), []() {
+        return g_guest_threads.empty();
+    });
+}
+
 void hle_kernel_shutdown() {
+    hle_kernel_request_shutdown();
     g_tick_running = false;
+#ifndef _WIN32
+    g_sync_cv.notify_all();
+#endif
     if (g_tick_thread.joinable()) g_tick_thread.join();
 }
 
 void hle_register_kernel() {
+    g_krnl_shutting_down.store(false, std::memory_order_release);
     constexpr uint32_t EBASE = HleKernelDataLayout::KERNEL_EXPORTS_BASE;
     std::memset(mem_ptr(EBASE), 0, 0x1000u);
 
